@@ -221,8 +221,14 @@ class PDFViewer(QScrollArea):
         self._fit_width = True
         self._scale = self.DEFAULT_SCALE
 
-        viewport_w = self.viewport().width() if self.viewport() else 800
-        target_w = max(viewport_w - 24, 300) if self._fit_width else None
+        # 改用 self.width() 作为主要参考——此时父布局已完成
+        viewport_w = max(
+            self.viewport().width() if self.viewport() else 0,
+            self.width(),
+            self.parent().width() if self.parent() else 0,
+            600,  # 最低保底
+        )
+        target_w = viewport_w - 24 if self._fit_width else None
 
         for i in range(len(self._doc)):
             page_widget = PDFPageWidget(i)
@@ -254,14 +260,12 @@ class PDFViewer(QScrollArea):
         self._scale = self.DEFAULT_SCALE
         if not self._doc:
             return
-        viewport_w = self.viewport().width() if self.viewport() else 800
-        target_w = max(viewport_w - 24, 300)
-        for i, pw in enumerate(self._pages):
-            pw.render_from_page(
-                self._doc[i],
-                target_width=target_w,
-                scale=self._scale,
-            )
+        viewport_w = max(
+            self.viewport().width() if self.viewport() else 0,
+            self.width(),
+            600,
+        )
+        self._render_all_with_width(viewport_w - 24)
 
     # ── 内部方法 ────────────────────────────────────────────
 
@@ -270,6 +274,18 @@ class PDFViewer(QScrollArea):
             self._layout.removeWidget(pw)
             pw.deleteLater()
         self._pages.clear()
+
+    def _render_all_with_width(self, target_w: int) -> None:
+        """以自适应宽度渲染所有页，保证清晰度"""
+        if not self._doc:
+            return
+        target_w = max(target_w, 300)
+        for i, pw in enumerate(self._pages):
+            pw.render_from_page(
+                self._doc[i],
+                target_width=target_w,
+                scale=self.DEFAULT_SCALE,
+            )
 
     def _set_zoom(self, new_scale: float) -> None:
         """真缩放：改变渲染比例，不限制宽度"""
@@ -293,11 +309,12 @@ class PDFViewer(QScrollArea):
     def resizeEvent(self, event: QResizeEvent | None) -> None:
         super().resizeEvent(event)
         if self._doc and self._pages and self._fit_width:
-            # 仅在自适应模式下跟随窗口宽度
-            viewport_w = self.viewport().width() if self.viewport() else 800
-            target_w = max(viewport_w - 24, 300)
-            for pw in self._pages:
-                pw.fit_to_width(target_w)
+            viewport_w = max(
+                self.viewport().width() if self.viewport() else 0,
+                self.width(),
+                600,
+            )
+            self._render_all_with_width(viewport_w - 24)
 
     def wheelEvent(self, event: QWheelEvent | None) -> None:
         if event is None:

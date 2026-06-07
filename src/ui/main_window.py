@@ -41,6 +41,7 @@ from src.ui.pdf_viewer import PDFViewer
 from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
 from src.ui.widgets.drop_zone import DropZone
+from src.ui.widgets.history_panel import HistoryPanel
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self._history.refresh()  # 启动时扫描已有记录
         self.setAcceptDrops(True)
 
     # ═══════════════════════════════════════════════════════════
@@ -166,11 +168,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._drop_zone)
 
         self._settings = SettingsPanel()
-        layout.addWidget(self._settings, stretch=1)
+        layout.addWidget(self._settings)
 
+        # 进度条
         self._progress = QProgressBar()
         self._progress.setVisible(False)
         layout.addWidget(self._progress)
+
+        # 历史记录
+        self._history = HistoryPanel(self._output_dir)
+        layout.addWidget(self._history)
 
         return sidebar
 
@@ -392,6 +399,7 @@ class MainWindow(QMainWindow):
         self._signals.progress.connect(self._on_progress)
         self._signals.finished.connect(self._on_finished)
         self._signals.error_occurred.connect(self._on_error)
+        self._history.result_selected.connect(self._on_history_selected)
 
     # ═══════════════════════════════════════════════════════════
     # PDF 加载
@@ -504,6 +512,8 @@ class MainWindow(QMainWindow):
             self._viewer.load_pdf(str(target))
             self._download_btn.setEnabled(True)
             self._update_zoom_label()
+            # 刷新历史记录
+            self._history.refresh()
         else:
             QMessageBox.warning(self, "结果缺失", "翻译流程已完成，但未生成输出文件。")
 
@@ -523,6 +533,29 @@ class MainWindow(QMainWindow):
                 self._settings.set_status(f"已保存: {Path(dest).name}")
             except Exception as exc:
                 QMessageBox.critical(self, "保存失败", str(exc))
+
+    # ═══════════════════════════════════════════════════════════
+    # 历史记录
+    # ═══════════════════════════════════════════════════════════
+
+    def _on_history_selected(self, dual_path: str, mono_path: str, name: str) -> None:
+        """点击历史记录中的翻译"""
+        target = dual_path or mono_path
+        if not target:
+            return
+        path = Path(target)
+        if not path.exists():
+            QMessageBox.warning(self, "文件不存在", f"历史文件已失效:\n{path}")
+            return
+        self._dual_path = Path(dual_path) if dual_path else None
+        self._mono_path = Path(mono_path) if mono_path else None
+
+        self._viewer.load_pdf(target)
+        self._tab_bar.setCurrentIndex(0)
+        self._tab_bar.setTabEnabled(1, True)
+        self._download_btn.setEnabled(bool(target))
+        self._settings.set_pdf_loaded(name, loaded=False)
+        self._settings.set_status(f"📜 历史: {name}")
 
     # ═══════════════════════════════════════════════════════════
     # 拖拽

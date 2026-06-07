@@ -48,7 +48,7 @@ class DropZone(QWidget):
         self._label = QLabel("拖拽 PDF 文件到此处\n或点击「选择文件」")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._label.setStyleSheet(
-            f"color: {Colors.ASH.name()}; font-size: 11pt; background: transparent;"
+            f"color: {Colors.ASH.name()}; font-size: 11pt; background: transparent;" 
         )
         layout.addWidget(self._label)
 
