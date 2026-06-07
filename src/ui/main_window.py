@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 
 from src.core.signals import TranslationEvent, TranslationTask, TranslationSignals
 from src.core.translator import TranslationEngine
+from PyQt6.QtGui import QIcon
 from src.ui.pdf_viewer import PDFViewer
 from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
@@ -84,6 +85,15 @@ class MainWindow(QMainWindow):
         self.resize(self.DEFAULT_W, self.DEFAULT_H)
 
         self._output_dir = _get_output_dir()
+
+        # 窗口图标（开发模式 & 打包模式兼容）
+        if getattr(sys, "frozen", False):
+            icon_base = Path(sys.executable).parent
+        else:
+            icon_base = Path(__file__).resolve().parent.parent
+        icon_path = icon_base / "src" / "resources" / "icons" / "app.ico"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         self._current_pdf: Path | None = None
         self._mono_path: Path | None = None

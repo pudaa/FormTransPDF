@@ -20,8 +20,7 @@ a = Analysis(
     pathex=[str(_root)],
     binaries=[],
     datas=[
-        # 如有图标等资源，在此添加
-        # (str(_root / "src" / "resources" / "icon.ico"), "resources"),
+        (str(_root / "src" / "resources"), "src/resources"),
     ],
     hiddenimports=[
         "pdf2zh_next",
