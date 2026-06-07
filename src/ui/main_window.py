@@ -187,7 +187,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         # 收起按钮
-        self._toggle_btn = self._make_icon_btn("☰", "收起 / 展开侧边栏")
+        self._toggle_btn = self._make_icon_btn("☰", "收起 / 展开侧边栏", width=38)
         self._toggle_btn.clicked.connect(self._toggle_sidebar)
         layout.addWidget(self._toggle_btn)
 
@@ -227,7 +227,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(sep)
 
         # 主题切换
-        self._theme_btn = self._make_icon_btn("☀" if theme_manager.is_dark else "🌙", "切换亮色/暗色主题", width=36)
+        self._theme_btn = self._make_icon_btn("☀" if theme_manager.is_dark else "🌙", "切换亮色/暗色主题", width=40)
         self._theme_btn.clicked.connect(self._on_toggle_theme)
         layout.addWidget(self._theme_btn)
 
@@ -260,12 +260,22 @@ class MainWindow(QMainWindow):
             self._toolbar_widget.setStyleSheet(bar_style)
 
         icon_btn_style = (
-            f"QPushButton {{ background-color: {tp.surface.name()};"
-            f"color: {tp.text_primary.name()};"
-            f"border: 1px solid {tp.divider.name()}; border-radius: 4px; font-size: 14pt; }}"
-            f"QPushButton:hover {{ background-color: {tp.accent_muted.name()};"
-            f"color: {tp.accent.name()}; border-color: {tp.accent.name()}; }}"
-            f"QPushButton:pressed {{ background-color: {tp.surface_hover.name()}; }}"
+            f"QPushButton {{"
+            f"  background-color: {tp.surface.name()};"
+            f"  color: {tp.accent.name()};"
+            f"  border: 1px solid {tp.divider.name()};"
+            f"  border-radius: 4px; font-size: 14pt;"
+            f"  padding: 0;"                     # ← 去掉默认内边距
+            f"}}"
+            f"QPushButton:hover {{"
+            f"  background-color: {tp.accent.name()};"
+            f"  color: {_contrast_text(tp.accent).name()};"
+            f"  border-color: {tp.accent.name()};"
+            f"}}"
+            f"QPushButton:pressed {{"
+            f"  background-color: {tp.accent_press.name()};"
+            f"  color: {_contrast_text(tp.accent_press).name()};"
+            f"}}"
         )
         for btn in [self._toggle_btn, self._theme_btn]:
             btn.setStyleSheet(icon_btn_style)
