@@ -1,16 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-FormTransPDF — PyInstaller 打包配置
+FormTransPDF — PyInstaller 打包配置（调试版）
 
 打包命令:
-    pyinstaller FormTransPDF.spec
-    # 打包为单文件
-    # → dist/FormTransPDF/FormTransPDF.exe 
-    # 打包带有命令行用于调试
-    pyinstaller FormTransPDF.spec --console
+    pyinstaller FormTransPDF_debug.spec
 
-策略: --onedir 模式，最大化兼容性，不压缩体积。
-      通过 collect-all 确保所有子模块、数据文件、插件均被包含。
+此版本保留控制台窗口，方便查看日志和调试信息。
 """
 
 import sys
@@ -50,7 +45,6 @@ _DATAS = [
 
 # ═══════════════════════════════════════════════════════════
 # ① 先执行 collect-all，将所有 hidden import / data 收集齐全
-#    （必须在 Analysis() 之前，否则 a.pure 已冻结，新模块不进入 PYZ）
 # ═══════════════════════════════════════════════════════════
 
 _all_hidden = list(_HIDDEN_IMPORTS)
@@ -71,8 +65,6 @@ for pkg in _COLLECT_ALL_PACKAGES:
         print(f"  [WARN] collect-all failed for {pkg}: {exc}")
 
 # ── 手动收集 delvewheel .libs 下的 DLL ────────────────────
-#    PyInstaller 对 numpy/pandas/scipy 有内置 hook，但 hyperscan 没有。
-#    用 sys.prefix 而非 site.getsitepackages()（后者在 exec() 中不可靠）。
 _site_packages = os.path.join(sys.prefix, 'Lib', 'site-packages')
 
 for _libs_name in os.listdir(_site_packages):
@@ -89,7 +81,7 @@ for _libs_name in os.listdir(_site_packages):
 _all_hidden = list(set(_all_hidden))
 
 # ═══════════════════════════════════════════════════════════
-# ② Analysis（此时 hiddenimports 已完整）
+# ② Analysis
 # ═══════════════════════════════════════════════════════════
 
 a = Analysis(
@@ -123,7 +115,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

@@ -14,6 +14,7 @@ usage:
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -45,4 +46,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Windows + PyInstaller 下 multiprocessing 用 spawn 模式，
+    # 子进程会 re-launch EXE 并传入 --multiprocessing-fork。
+    # freeze_support() 必须在任何其他代码之前调用，确保子进程正确初始化。
+    multiprocessing.freeze_support()
     sys.exit(main())

@@ -43,6 +43,7 @@ from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
 from src.ui.widgets.drop_zone import DropZone
 from src.ui.widgets.history_panel import HistoryPanel
+from src.ui.widgets.minimap import MinimapPanel, generate_thumbnails
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class MainWindow(QMainWindow):
 
         self._signals = TranslationSignals()
         self._engine = TranslationEngine()
+        self._minimap: MinimapPanel | None = None  # 在 _build_ui 中创建
 
         self._build_ui()
         self._connect_signals()
@@ -147,6 +149,11 @@ class MainWindow(QMainWindow):
 
         self._viewer = PDFViewer()
         main_layout.addWidget(self._viewer, stretch=1)
+
+        # 缩略图导航（覆盖在 PDF 查看器右上角）
+        self._minimap = MinimapPanel(self._viewer)
+        self._minimap.page_clicked.connect(self._on_minimap_page_clicked)
+        self._minimap.viewport_dragged.connect(self._on_minimap_dragged)
 
         root.addWidget(main_area, stretch=1)
 
@@ -237,6 +244,11 @@ class MainWindow(QMainWindow):
             self._zoom_btns.append(btn)
             layout.addWidget(btn)
 
+        # 缩略图切换
+        self._minimap_btn = self._make_icon_btn("▦", "切换缩略图导航", width=38)
+        self._minimap_btn.clicked.connect(lambda: self._minimap and self._minimap.toggle())
+        layout.addWidget(self._minimap_btn)
+
         # 分隔
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
@@ -294,7 +306,7 @@ class MainWindow(QMainWindow):
             f"  color: {_contrast_text(tp.accent_press).name()};"
             f"}}"
         )
-        for btn in [self._toggle_btn, self._theme_btn]:
+        for btn in [self._toggle_btn, self._theme_btn, self._minimap_btn]:
             btn.setStyleSheet(icon_btn_style)
         if hasattr(self, "_zoom_btns"):
             for btn in self._zoom_btns:
@@ -436,6 +448,8 @@ class MainWindow(QMainWindow):
         self._viewer.clear()
         try:
             self._viewer.load_pdf(str(pdf_path))
+            # 生成缩略图并加载到 minimap
+            self._setup_minimap()
         except Exception as exc:
             QMessageBox.critical(self, "PDF 加载失败", str(exc))
             return
@@ -453,10 +467,12 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, index: int) -> None:
         if index == 0 and self._current_pdf:
             self._viewer.load_pdf(str(self._current_pdf))
+            self._setup_minimap()
         elif index == 1:
             target = self._dual_path or self._mono_path
             if target and target.exists():
                 self._viewer.load_pdf(str(target))
+                self._setup_minimap()
         self._update_zoom_label()
 
     # ═══════════════════════════════════════════════════════════
@@ -566,6 +582,64 @@ class MainWindow(QMainWindow):
         self._download_btn.setEnabled(bool(target))
         self._settings.set_pdf_loaded(name, loaded=False)
         self._settings.set_status(f"📜 历史: {name}")
+
+    # ═══════════════════════════════════════════════════════════
+    # 缩略图导航
+    # ═══════════════════════════════════════════════════════════
+
+    def _setup_minimap(self) -> None:
+        """为当前 PDF 生成缩略图并加载到 minimap"""
+        doc = self._viewer.document
+        if doc is None:
+            return
+        try:
+            thumbs = generate_thumbnails(doc, self._viewer.page_count)
+            self._minimap.load_document(self._viewer.page_count, thumbs)
+            self._position_minimap()
+            self._minimap.show()
+            # 监听滚动条变化，同步视口指示器
+            self._viewer.verticalScrollBar().valueChanged.connect(
+                self._update_minimap_viewport
+            )
+        except Exception:
+            logger.debug("Failed to generate thumbnails", exc_info=True)
+
+    def _position_minimap(self) -> None:
+        """将 minimap 定位到 viewer 视口右上角"""
+        vp = self._viewer.viewport()
+        x = vp.width() - self._minimap.width() - 8
+        y = 8
+        self._minimap.move(x, y)
+        self._minimap.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._minimap.isVisible():
+            self._position_minimap()
+
+    def _update_minimap_viewport(self) -> None:
+        """根据当前滚动位置更新 minimap 的视口指示器"""
+        vbar = self._viewer.verticalScrollBar()
+        if vbar.maximum() <= 0:
+            return
+        ratio_start = vbar.value() / vbar.maximum()
+        viewport_h = self._viewer.viewport().height()
+        total_h = self._viewer.widget().height() if self._viewer.widget() else 1
+        ratio_end = min((vbar.value() + viewport_h) / max(total_h, 1), 1.0)
+        self._minimap.set_visible_range(ratio_start, ratio_end)
+
+    def _on_minimap_page_clicked(self, page_number: int) -> None:
+        """点击 minimap 缩略图 → 跳转到对应页面"""
+        if not self._viewer._pages or page_number >= len(self._viewer._pages):
+            return
+        pw = self._viewer._pages[page_number]
+        self._viewer.ensureWidgetVisible(pw, 0, 0)
+
+    def _on_minimap_dragged(self, ratio: float) -> None:
+        """拖拽 minimap 视口指示器 → 实时滚动 PDF"""
+        vbar = self._viewer.verticalScrollBar()
+        if vbar and vbar.maximum() > 0:
+            vbar.setValue(int(ratio * vbar.maximum()))
 
     # ═══════════════════════════════════════════════════════════
     # 拖拽

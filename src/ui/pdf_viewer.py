@@ -45,6 +45,7 @@ class PDFPageWidget(QLabel):
         super().__init__(parent)
         self._page_number = page_number
         self._source_image: QImage | None = None
+        self._source_scale: float = 1.0   # 源图渲染时的缩放比（用于缩放时计算）
         self._scale: float = 1.0
 
         self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
@@ -73,14 +74,20 @@ class PDFPageWidget(QLabel):
         self,
         page: fitz.Page,
         target_width: int | None = None,
-        scale: float = 1.5,
+        scale: float = 3.0,
     ) -> None:
-        """从 PyMuPDF Page 渲染。
+        """从 PyMuPDF Page 渲染（重量级 — 仅首次加载时调用）。
 
         scale 控制实际渲染分辨率；
         target_width 为 None 时按原始比例显示（真缩放），
         否则自适应到指定宽度。
         """
+        # 动态计算渲染缩放比：确保渲染分辨率 ≥ 目标显示宽度
+        if target_width and target_width > 0:
+            page_w = page.rect.width
+            min_scale = target_width / page_w if page_w > 0 else scale
+            scale = max(scale, min_scale)
+        self._source_scale = scale
         self._scale = scale
 
         mat = fitz.Matrix(scale, scale)
@@ -98,9 +105,32 @@ class PDFPageWidget(QLabel):
         if target_width and target_width > 0:
             self._display_scaled(target_width)
         else:
-            # 真缩放模式：按渲染分辨率原样显示
             self.setPixmap(QPixmap.fromImage(self._source_image))
             self.setFixedSize(self._source_image.size())
+
+    def render_from_source(
+        self,
+        target_width: int | None = None,
+        scale: float | None = None,
+    ) -> None:
+        """从已有高分辨率源图缩放显示（轻量级 — 缩放时调用）。
+
+        :param target_width: 自适应宽度模式下的目标宽度
+        :param scale: 真缩放模式下的绝对缩放比（相对 PDF 页面）
+        """
+        src = self._source_image
+        if src is None:
+            return
+
+        if scale is not None:
+            self._scale = scale
+
+        if target_width and target_width > 0:
+            self._display_scaled(target_width)
+        elif scale is not None:
+            # 真缩放：显示宽度 = 源图宽 × (目标scale / 源scale)
+            w = int(src.width() * scale / self._source_scale)
+            self._display_scaled(w)
 
     # ── 尺寸适配 ────────────────────────────────────────────
 
@@ -131,9 +161,13 @@ class PDFPageWidget(QLabel):
     # ── 事件 ────────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent | None) -> None:
+        # 仅双击时触发页面定位；单击留给文本选择 / 滚动等操作
+        pass
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent | None) -> None:
         if event and event.button() == Qt.MouseButton.LeftButton:
             self.page_clicked.emit(self._page_number)
-        super().mousePressEvent(event)
+        super().mouseDoubleClickEvent(event)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -150,7 +184,7 @@ class PDFViewer(QScrollArea):
         viewer.load_pdf("/path/to/doc.pdf")
     """
 
-    DEFAULT_SCALE = 1.5
+    DEFAULT_SCALE = 3.0   # 提高默认渲染精度，避免高分辨率屏幕下模糊
     MIN_SCALE = 0.3
     MAX_SCALE = 8.0
 
@@ -276,28 +310,20 @@ class PDFViewer(QScrollArea):
         self._pages.clear()
 
     def _render_all_with_width(self, target_w: int) -> None:
-        """以自适应宽度渲染所有页，保证清晰度"""
+        """以自适应宽度渲染所有页 —— 从已缓存的源图缩放（快）"""
         if not self._doc:
             return
         target_w = max(target_w, 300)
-        for i, pw in enumerate(self._pages):
-            pw.render_from_page(
-                self._doc[i],
-                target_width=target_w,
-                scale=self.DEFAULT_SCALE,
-            )
+        for pw in self._pages:
+            pw.render_from_source(target_width=target_w)
 
     def _set_zoom(self, new_scale: float) -> None:
-        """真缩放：改变渲染比例，不限制宽度"""
+        """真缩放：从已缓存的源图按比例缩放（快），不重渲染 PDF"""
         self._scale = max(self.MIN_SCALE, min(self.MAX_SCALE, new_scale))
         if not self._doc:
             return
-        for i, pw in enumerate(self._pages):
-            pw.render_from_page(
-                self._doc[i],
-                target_width=None,  # 真缩放：不限制宽度
-                scale=self._scale,
-            )
+        for pw in self._pages:
+            pw.render_from_source(scale=self._scale)
 
     def _on_page_clicked(self, page_number: int) -> None:
         if 0 <= page_number < len(self._pages):

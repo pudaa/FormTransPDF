@@ -111,7 +111,25 @@ class TranslationEngine:
             async for raw_event in do_translate_async_stream(settings, task.input_pdf):
                 event_type = raw_event.get("type", "")
 
-                if event_type == "progress":
+                # ── babeldoc 新版事件：progress_start / progress_update / progress_end ──
+                if event_type in ("progress_start", "progress_update", "progress_end"):
+                    overall = raw_event.get("overall_progress", 0.0)
+                    stage = raw_event.get("stage", "")
+                    stage_current = raw_event.get("stage_current", 0)
+                    stage_total = raw_event.get("stage_total", 0)
+
+                    ev = TranslationEvent(
+                        event_type="progress",
+                        current=int(overall),
+                        total=100,
+                        message=f"翻译中… {stage} ({stage_current}/{stage_total}) — {overall:.0f}%",
+                    )
+                    if signals:
+                        signals.progress.emit(ev)
+                    yield ev
+
+                # ── 兼容旧版 progress 事件（n / total）──────────────────────
+                elif event_type == "progress":
                     ev = TranslationEvent(
                         event_type="progress",
                         current=raw_event.get("n", 0),
