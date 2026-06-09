@@ -18,7 +18,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QEasingCurve, QVariantAnimation
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,7 +37,6 @@ from PyQt6.QtWidgets import (
 
 from src.core.signals import TranslationEvent, TranslationTask, TranslationSignals
 from src.core.translator import TranslationEngine
-from PyQt6.QtGui import QIcon
 from src.ui.pdf_viewer import PDFViewer
 from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
@@ -87,19 +86,14 @@ class MainWindow(QMainWindow):
 
         self._output_dir = _get_output_dir()
 
-        # 窗口图标（开发模式 & 打包模式兼容）
-        if getattr(sys, "frozen", False):
-            icon_base = Path(sys.executable).parent
-        else:
-            icon_base = Path(__file__).resolve().parent.parent
-        icon_path = icon_base / "src" / "resources" / "icons" / "app.ico"
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        # 窗口图标已在 app.py 中通过 QApplication.setWindowIcon 统一设置，
+        # Windows 任务栏图标需要 QApplication 级别的图标，此处不再重复设置。
 
         self._current_pdf: Path | None = None
         self._mono_path: Path | None = None
         self._dual_path: Path | None = None
         self._sidebar_visible = True
+        self._sidebar_anim: QVariantAnimation | None = None
 
         self._signals = TranslationSignals()
         self._engine = TranslationEngine()
@@ -133,6 +127,7 @@ class MainWindow(QMainWindow):
 
         self._sidebar_sep = QFrame()
         self._sidebar_sep.setFrameShape(QFrame.Shape.VLine)
+        self._sidebar_sep.setMinimumWidth(0)  # 允许动画收缩到 0
         self._sidebar_sep.setStyleSheet(f"color: {tp.divider.name()};")
         root.addWidget(self._sidebar_sep)
 
@@ -161,7 +156,10 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         tp = self._tp
         sidebar = QWidget()
-        sidebar.setFixedWidth(self.SIDEBAR_WIDTH)
+        # 不使用 setFixedWidth —— 它会同时锁定 min/max 宽度，后续动画无法收缩
+        sidebar.setMinimumWidth(0)
+        sidebar.setMaximumWidth(self.SIDEBAR_WIDTH)
+        sidebar.resize(self.SIDEBAR_WIDTH, sidebar.height())
         sidebar.setObjectName("sidebar")
         sidebar.setStyleSheet(f"QWidget#sidebar {{ background-color: {tp.background.name()}; }}")
 
@@ -400,13 +398,63 @@ class MainWindow(QMainWindow):
 
     def _toggle_sidebar(self) -> None:
         self._sidebar_visible = not self._sidebar_visible
-        self._sidebar.setVisible(self._sidebar_visible)
-        self._sidebar_sep.setVisible(self._sidebar_visible)
-        # 侧边栏展开/收起后 viewer 视口宽度变化，需重定位 minimap
-        # 用 singleShot 延迟到布局完成后再计算位置
+        target_w = self.SIDEBAR_WIDTH if self._sidebar_visible else 0
+        start_w = self._sidebar.width()
+
+        # 确保展开前 widget 可见
+        if self._sidebar_visible:
+            self._sidebar.setVisible(True)
+            self._sidebar_sep.setVisible(True)
+
+        # 如果已在目标宽度，跳过
+        if start_w == target_w:
+            if not self._sidebar_visible:
+                self._on_sidebar_collapsed()
+            return
+
+        # ── 使用 QVariantAnimation 驱动 setFixedWidth，
+        #    直接强制宽度，不受布局缓存 / 子控件 min-size 干扰 ──
+        self._sidebar_anim = QVariantAnimation()
+        self._sidebar_anim.setDuration(260)
+        self._sidebar_anim.setStartValue(start_w)
+        self._sidebar_anim.setEndValue(target_w)
+        self._sidebar_anim.setEasingCurve(
+            QEasingCurve.Type.OutCubic if self._sidebar_visible
+            else QEasingCurve.Type.InCubic
+        )
+
+        def _drive(value: float) -> None:
+            w = int(value)
+            self._sidebar.setFixedWidth(w)
+            self._sidebar_sep.setFixedWidth(2 if w > 10 else 0)
+
+        self._sidebar_anim.valueChanged.connect(_drive)
+
+        if not self._sidebar_visible:
+            self._sidebar_anim.finished.connect(self._on_sidebar_collapsed)
+        else:
+            self._sidebar_anim.finished.connect(self._on_sidebar_expanded)
+
+        self._sidebar_anim.finished.connect(self._on_sidebar_anim_finished)
+        self._sidebar_anim.start()
+
+    def _on_sidebar_collapsed(self) -> None:
+        """收起动画结束后隐藏侧边栏和分隔线"""
+        self._sidebar.setVisible(False)
+        self._sidebar_sep.setVisible(False)
+
+    def _on_sidebar_expanded(self) -> None:
+        """展开动画结束后恢复约束（为下次收起动画做准备）"""
+        # 从 setFixedWidth 的锁死状态恢复为可动画的 min/max 模式
+        self._sidebar.setMinimumWidth(0)
+        self._sidebar.setMaximumWidth(self.SIDEBAR_WIDTH)
+        self._sidebar_sep.setMinimumWidth(0)
+        self._sidebar_sep.setMaximumWidth(2)
+
+    def _on_sidebar_anim_finished(self) -> None:
+        """动画结束后重定位 minimap（布局已稳定）"""
         if self._minimap and self._minimap.isVisible():
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(0, self._position_minimap)
+            self._position_minimap()
 
     def _update_zoom_label(self) -> None:
         if self._viewer.is_fit_width:

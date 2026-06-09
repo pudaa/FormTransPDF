@@ -3,6 +3,14 @@ PDF 页面渲染与查看组件
 
 基于 PyMuPDF（fitz），将 PDF 页面渲染为 QImage，由 QLabel 承载展示。
 支持缩放、分页渲染、自适应宽度。
+
+渲染策略：
+  Zotero / PDF.js 使用浏览器原生 DirectWrite（ClearType 次像素渲染），
+  文字边缘锐利、颜色深。PyMuPDF 使用 FreeType 灰阶抗锯齿，天生偏软。
+  为弥补差距，采用 2× 超采样渲染 + 高质量降采样：
+  - 显示：PyMuPDF 按 2× 目标尺寸渲染 → QImage.scaled(SmoothTransformation) 降采样
+  - 缩放：2.5× 高分辨率源图缓存 → 缩放时从缓存渲染
+  2× 超采样相当于每个输出像素各 4 个采样点，效果接近次像素渲染。
 """
 
 from __future__ import annotations
@@ -36,7 +44,9 @@ from src.ui.theme import Colors
 class PDFPageWidget(QLabel):
     """单页 PDF 渲染组件。
 
-    将 PyMuPDF 的 page.get_pixmap() 输出转为 QPixmap 显示。
+    双缓冲策略：
+    - _source_image: 高分辨率源图（≥ 2.5× 显示宽度），用于手动缩放
+    - 显示：直接从 PyMuPDF 按精确分辨率渲染，无 QImage 二次缩放，文字锐利
     """
 
     page_clicked = pyqtSignal(int)  # page_number
@@ -44,8 +54,9 @@ class PDFPageWidget(QLabel):
     def __init__(self, page_number: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._page_number = page_number
-        self._source_image: QImage | None = None
-        self._source_scale: float = 1.0   # 源图渲染时的缩放比（用于缩放时计算）
+        self._page: fitz.Page | None = None      # PyMuPDF 页面引用，用于精确渲染
+        self._source_image: QImage | None = None  # 高分辨率缓存，用于手动缩放
+        self._source_scale: float = 1.0
         self._scale: float = 1.0
 
         self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
@@ -76,35 +87,35 @@ class PDFPageWidget(QLabel):
         target_width: int | None = None,
         scale: float = 3.0,
     ) -> None:
-        """从 PyMuPDF Page 渲染（重量级 — 仅首次加载时调用）。
+        """从 PyMuPDF Page 渲染。
 
-        scale 控制实际渲染分辨率；
-        target_width 为 None 时按原始比例显示（真缩放），
-        否则自适应到指定宽度。
+        - target_width 非 None：自适应宽度，2× 超采样显示 + 缓源图供缩放。
+        - target_width 为 None：真缩放模式，直接按 scale 显示。
         """
-        # 动态计算渲染缩放比：确保渲染分辨率 ≥ 目标显示宽度
-        if target_width and target_width > 0:
-            page_w = page.rect.width
-            min_scale = target_width / page_w if page_w > 0 else scale
-            scale = max(scale, min_scale)
-        self._source_scale = scale
+        self._page = page
         self._scale = scale
 
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat)
-
-        img = QImage(
-            pix.samples,
-            pix.width,
-            pix.height,
-            pix.stride,
-            QImage.Format.Format_RGB888,
-        )
-        self._source_image = img.copy()
-
         if target_width and target_width > 0:
-            self._display_scaled(target_width)
+            page_w = page.rect.width
+            # 源图缓存：至少 2.5× 显示宽度
+            self._source_scale = max(scale, target_width * 2.5 / page_w)
+            mat = fitz.Matrix(self._source_scale, self._source_scale)
+            pix = page.get_pixmap(matrix=mat)
+            self._source_image = QImage(
+                pix.samples, pix.width, pix.height,
+                pix.stride, QImage.Format.Format_RGB888,
+            ).copy()
+            # 显示：2× 超采样 → 降采样（补偿 FreeType 无次像素渲染）
+            self._render_supersampled(target_width)
         else:
+            self._source_scale = scale
+            mat = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=mat)
+            img = QImage(
+                pix.samples, pix.width, pix.height,
+                pix.stride, QImage.Format.Format_RGB888,
+            )
+            self._source_image = img.copy()
             self.setPixmap(QPixmap.fromImage(self._source_image))
             self.setFixedSize(self._source_image.size())
 
@@ -113,11 +124,7 @@ class PDFPageWidget(QLabel):
         target_width: int | None = None,
         scale: float | None = None,
     ) -> None:
-        """从已有高分辨率源图缩放显示（轻量级 — 缩放时调用）。
-
-        :param target_width: 自适应宽度模式下的目标宽度
-        :param scale: 真缩放模式下的绝对缩放比（相对 PDF 页面）
-        """
+        """缩放显示：有 target_width 时精确渲染，否则从源图缩放。"""
         src = self._source_image
         if src is None:
             return
@@ -126,32 +133,52 @@ class PDFPageWidget(QLabel):
             self._scale = scale
 
         if target_width and target_width > 0:
-            self._display_scaled(target_width)
+            # 适配宽度 → 2× 超采样渲染
+            self._render_supersampled(target_width)
         elif scale is not None:
-            # 真缩放：显示宽度 = 源图宽 × (目标scale / 源scale)
+            # 手动缩放 → 从高分辨率源图缩放
             w = int(src.width() * scale / self._source_scale)
             self._display_scaled(w)
 
     # ── 尺寸适配 ────────────────────────────────────────────
 
-    def fit_to_width(self, width: int) -> None:
-        """按宽度缩放显示"""
-        if self._source_image is None:
+    def _render_supersampled(self, target_width: int) -> None:
+        """2× 超采样渲染 + SmoothTransformation 降采样。
+
+        Zotero / PDF.js 使用 DirectWrite（ClearType 次像素渲染），
+        文字边缘锐利、墨色深。PyMuPDF 依赖 FreeType 灰阶抗锯齿，
+        天生边缘偏软。以 2× 超采样（每输出像素 4 采样点）弥补差距。
+        """
+        if self._page is None:
             return
-        self._display_scaled(width)
+        page_w = self._page.rect.width
+        # 2× 超采样
+        render_scale = target_width * 2.0 / page_w
+        mat = fitz.Matrix(render_scale, render_scale)
+        pix = self._page.get_pixmap(matrix=mat)
+        hires = QImage(
+            pix.samples, pix.width, pix.height,
+            pix.stride, QImage.Format.Format_RGB888,
+        ).copy()
+        # 降采样到目标宽度
+        disp_h = int(hires.height() * target_width / hires.width())
+        display = hires.scaled(
+            target_width, disp_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(QPixmap.fromImage(display))
+        self.setFixedSize(display.size())
 
     def _display_scaled(self, target_width: int) -> None:
-        """内部——缩放并设置 pixmap"""
+        """从高分辨率源图缩放（手动缩放时使用）"""
         src = self._source_image
         if src is None:
             return
-
         ratio = target_width / src.width()
         h = int(src.height() * ratio)
-
         scaled = src.scaled(
-            target_width,
-            h,
+            target_width, h,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )

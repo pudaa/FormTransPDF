@@ -7,9 +7,10 @@ from __future__ import annotations
 import sys
 import asyncio
 import logging
+from pathlib import Path
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QPalette
+from PyQt6.QtGui import QFont, QIcon, QPalette
 from PyQt6.QtWidgets import QApplication
 
 import qasync
@@ -40,8 +41,20 @@ class FormTransPDFApp(QApplication):
         self.setApplicationVersion(__version__)
         self.setOrganizationName("FormTransPDF")
 
+        # ── 应用图标（Windows 任务栏/标题栏）──
+        self._set_app_icon()
+
         self._theme_manager = ThemeManager()
         self._apply_theme()
+
+    def _set_app_icon(self) -> None:
+        """设置应用图标 — 必须在窗口创建之前调用，Windows 任务栏才生效"""
+        if getattr(sys, "frozen", False):
+            icon_path = Path(sys._MEIPASS) / "src" / "resources" / "icons" / "app.ico"
+        else:
+            icon_path = Path(__file__).resolve().parent / "resources" / "icons" / "app.ico"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
     # ── 主题 ────────────────────────────────────────────────
 

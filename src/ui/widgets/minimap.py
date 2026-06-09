@@ -9,7 +9,7 @@ Design: "Quiet Navigator" — 克制的琥珀/青铜指示器，柔光半透明�
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QRect, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QEasingCurve, QPropertyAnimation, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QPainter,
@@ -21,7 +21,7 @@ from PyQt6.QtGui import (
     QImage,
     QEnterEvent,
 )
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
 from src.ui.theme import theme_manager, ThemePalette, ThemeMode
 
@@ -56,11 +56,18 @@ class MinimapPanel(QWidget):
         self._drag_start_ratio: float = 0.0
         self._total_content_h: int = 0
         self._opacity_base: int = 160       # 基础不透明度
+        self._fade_anim: QPropertyAnimation | None = None
+
+        # 透明度效果 — 用于淡入淡出动画
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self._opacity_effect.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity_effect)
 
         self.setFixedWidth(self.PANEL_WIDTH)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.hide()
+        # 始终 "可见"，但默认 opacity=0（透明不可交互）
+        self.show()
 
     # ── 公开方法 ────────────────────────────────────────────
 
@@ -76,7 +83,27 @@ class MinimapPanel(QWidget):
             self.update()
 
     def toggle(self) -> None:
-        self.setVisible(not self.isVisible())
+        """带动画的显示/隐藏切换"""
+        # 停止正在进行的动画
+        if self._fade_anim is not None and self._fade_anim.state() == QPropertyAnimation.State.Running:
+            self._fade_anim.stop()
+
+        currently_visible = self._opacity_effect.opacity() > 0.01
+        target_opacity = 0.0 if currently_visible else 1.0
+
+        self._fade_anim = QPropertyAnimation(self._opacity_effect, b"opacity")
+        self._fade_anim.setDuration(220)
+        self._fade_anim.setStartValue(self._opacity_effect.opacity())
+        self._fade_anim.setEndValue(target_opacity)
+        self._fade_anim.setEasingCurve(
+            QEasingCurve.Type.OutCubic if target_opacity > 0.5
+            else QEasingCurve.Type.InCubic
+        )
+        self._fade_anim.start()
+
+    def isVisible(self) -> bool:
+        """重写：以 opacity 为准判断可见性"""
+        return self._opacity_effect.opacity() > 0.01
 
     # ── 内部 ────────────────────────────────────────────────
 
