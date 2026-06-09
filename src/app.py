@@ -9,9 +9,9 @@ import asyncio
 import logging
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QIcon, QPalette
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QIcon, QPalette
+from PySide6.QtWidgets import QApplication
 
 import qasync
 
@@ -79,6 +79,12 @@ class FormTransPDFApp(QApplication):
     # ── 启动 ────────────────────────────────────────────────
 
     def run(self) -> int:
+        # ── 启动画面（在慢速 babeldoc 导入前展示）──
+        from src.ui.splash import StartupSplash
+        splash = StartupSplash()
+        splash.show()
+        self.processEvents()  # 强制绘制启动画面
+
         from src.ui.main_window import MainWindow
 
         loop = qasync.QEventLoop(self)
@@ -86,6 +92,8 @@ class FormTransPDFApp(QApplication):
 
         window = MainWindow()
         window.show()
+
+        splash.finish(window)  # 关闭启动画面
 
         with loop:
             loop.run_forever()

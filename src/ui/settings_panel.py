@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QSettings
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QSettings
+from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QGroupBox,
@@ -214,8 +214,6 @@ class SettingsPanel(QWidget):
         self._status_label.setObjectName("statusLabel")
         self._status_label.setWordWrap(True)
         root.addWidget(self._status_label)
-
-        root.addStretch()
 
     # ═══════════════════════════════════════════════════════════
     # 持久化

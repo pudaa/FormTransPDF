@@ -18,9 +18,9 @@ import shutil
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QEasingCurve, QVariantAnimation
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QEasingCurve, QVariantAnimation
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFrame,
@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
         self._signals = TranslationSignals()
         self._engine = TranslationEngine()
         self._minimap: MinimapPanel | None = None  # 在 _build_ui 中创建
+        self._minimap_synced = False  # 滚动条信号是否已连接
 
         self._build_ui()
         self._connect_signals()
@@ -191,7 +192,7 @@ class MainWindow(QMainWindow):
 
         # 历史记录
         self._history = HistoryPanel(self._output_dir)
-        layout.addWidget(self._history)
+        layout.addWidget(self._history, stretch=1)
 
         return sidebar
 
@@ -384,13 +385,7 @@ class MainWindow(QMainWindow):
         self._theme_btn.setText("☀" if theme_manager.is_dark else "🌙")
 
         # 更新 PDF 容器背景
-        if self._viewer._container:
-            self._viewer._container.setStyleSheet(
-                f"QWidget#pdfContainer {{ background-color: {tp.canvas.name()}; }}"
-            )
-        self._viewer.setStyleSheet(
-            f"QScrollArea {{ background-color: {tp.canvas.name()}; border: none; }}"
-        )
+        self._viewer.refresh_theme()
 
     # ═══════════════════════════════════════════════════════════
     # 侧边栏 / 缩放
@@ -474,6 +469,10 @@ class MainWindow(QMainWindow):
         self._signals.finished.connect(self._on_finished)
         self._signals.error_occurred.connect(self._on_error)
         self._history.result_selected.connect(self._on_history_selected)
+        # 输出模式变更时（历史回放场景）切换双栏/单栏
+        self._settings._output_mode_combo.currentIndexChanged.connect(
+            self._on_output_mode_changed
+        )
 
     # ═══════════════════════════════════════════════════════════
     # PDF 加载
@@ -629,11 +628,25 @@ class MainWindow(QMainWindow):
         self._mono_path = Path(mono_path) if mono_path else None
 
         self._viewer.load_pdf(target)
+        self._setup_minimap()
         self._tab_bar.setCurrentIndex(0)
         self._tab_bar.setTabEnabled(1, True)
         self._download_btn.setEnabled(bool(target))
         self._settings.set_pdf_loaded(name, loaded=False)
         self._settings.set_status(f"📜 历史: {name}")
+
+    def _on_output_mode_changed(self) -> None:
+        """输出模式下拉框变更时，若正在查看历史记录则切换双栏/单栏"""
+        # 仅在有历史双栏+单栏文件时生效
+        if not (self._dual_path and self._mono_path):
+            return
+        mode = self._settings._output_mode_combo.currentData()
+        if mode == "mono" and self._mono_path.exists():
+            self._viewer.load_pdf(str(self._mono_path))
+            self._setup_minimap()
+        elif mode == "dual" and self._dual_path.exists():
+            self._viewer.load_pdf(str(self._dual_path))
+            self._setup_minimap()
 
     # ═══════════════════════════════════════════════════════════
     # 缩略图导航
@@ -642,24 +655,25 @@ class MainWindow(QMainWindow):
     def _setup_minimap(self) -> None:
         """为当前 PDF 生成缩略图并加载到 minimap（默认隐藏，通过按钮唤起）"""
         doc = self._viewer.document
-        if doc is None:
+        from PySide6.QtPdf import QPdfDocument
+        if doc is None or doc.status() != QPdfDocument.Status.Ready:
             return
         try:
             thumbs = generate_thumbnails(doc, self._viewer.page_count)
             self._minimap.load_document(self._viewer.page_count, thumbs)
             self._position_minimap()
-            # 默认隐藏，用户通过 ▦ 按钮切换显示
-            # 监听滚动条变化，同步视口指示器
-            self._viewer.verticalScrollBar().valueChanged.connect(
-                self._update_minimap_viewport
-            )
+            # 监听滚动条变化（仅首次连接，避免重复）
+            if not self._minimap_synced:
+                self._viewer.verticalScrollBar().valueChanged.connect(
+                    self._update_minimap_viewport
+                )
+                self._minimap_synced = True
         except Exception:
             logger.debug("Failed to generate thumbnails", exc_info=True)
 
     def _position_minimap(self) -> None:
-        """将 minimap 定位到 viewer 视口右上角"""
-        vp = self._viewer.viewport()
-        x = vp.width() - self._minimap.width() - 8
+        """将 minimap 定位到 viewer 右上角"""
+        x = self._viewer.width() - self._minimap.width() - 8
         y = 8
         self._minimap.move(x, y)
         self._minimap.raise_()
@@ -676,16 +690,14 @@ class MainWindow(QMainWindow):
             return
         ratio_start = vbar.value() / vbar.maximum()
         viewport_h = self._viewer.viewport().height()
-        total_h = self._viewer.widget().height() if self._viewer.widget() else 1
+        # QPdfView 内容总高度 = scrollbar_max + viewport_height
+        total_h = vbar.maximum() + viewport_h
         ratio_end = min((vbar.value() + viewport_h) / max(total_h, 1), 1.0)
         self._minimap.set_visible_range(ratio_start, ratio_end)
 
     def _on_minimap_page_clicked(self, page_number: int) -> None:
         """点击 minimap 缩略图 → 跳转到对应页面"""
-        if not self._viewer._pages or page_number >= len(self._viewer._pages):
-            return
-        pw = self._viewer._pages[page_number]
-        self._viewer.ensureWidgetVisible(pw, 0, 0)
+        self._viewer.goto_page(page_number)
 
     def _on_minimap_dragged(self, ratio: float) -> None:
         """拖拽 minimap 视口指示器 → 实时滚动 PDF"""

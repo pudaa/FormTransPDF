@@ -2,7 +2,7 @@
 """
 FormTransPDF — PDF 科学论文翻译查看器
 
-基于 pdf2zh-next（BabelDOC）和 PyQt6 构建。
+基于 pdf2zh-next（BabelDOC）和 PySide6 构建。
 "Gilded Ink" 美学 — 左右分栏 + 金脊线设计。
 
 usage:

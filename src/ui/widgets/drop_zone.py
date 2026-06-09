@@ -6,9 +6,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QPainter, QPen, QColor
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPainter, QPen, QColor
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from src.ui.theme import Colors
 
@@ -24,7 +24,7 @@ class DropZone(QWidget):
         pdf_dropped(str) — 传入 PDF 文件绝对路径
     """
 
-    pdf_dropped = pyqtSignal(str)
+    pdf_dropped = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)

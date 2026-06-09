@@ -5,7 +5,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PySide6.QtCore import QObject, Signal
 
 
 @dataclass
@@ -46,6 +46,6 @@ class TranslationSignals(QObject):
         signals.error_occurred.connect(my_slot)
     """
 
-    progress = pyqtSignal(TranslationEvent)
-    finished = pyqtSignal(TranslationEvent)
-    error_occurred = pyqtSignal(TranslationEvent)
+    progress = Signal(TranslationEvent)
+    finished = Signal(TranslationEvent)
+    error_occurred = Signal(TranslationEvent)

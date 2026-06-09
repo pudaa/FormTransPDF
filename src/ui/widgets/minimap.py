@@ -9,8 +9,8 @@ Design: "Quiet Navigator" — 克制的琥珀/青铜指示器，柔光半透明�
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QRect, QEasingCurve, QPropertyAnimation, pyqtSignal
-from PyQt6.QtGui import (
+from PySide6.QtCore import Qt, QRect, QEasingCurve, QPropertyAnimation, QSize, Signal
+from PySide6.QtGui import (
     QColor,
     QPainter,
     QPen,
@@ -21,7 +21,8 @@ from PyQt6.QtGui import (
     QImage,
     QEnterEvent,
 )
-from PyQt6.QtWidgets import QGraphicsOpacityEffect, QWidget
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
 from src.ui.theme import theme_manager, ThemePalette, ThemeMode
 
@@ -42,8 +43,8 @@ class MinimapPanel(QWidget):
     PANEL_WIDTH = 100
     MIN_PAGE_HEIGHT = 6
 
-    page_clicked = pyqtSignal(int)
-    viewport_dragged = pyqtSignal(float)       # 垂直比例 (0~1)
+    page_clicked = Signal(int)
+    viewport_dragged = Signal(float)       # 垂直比例 (0~1)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -78,9 +79,8 @@ class MinimapPanel(QWidget):
         self.update()
 
     def set_visible_range(self, start_ratio: float, end_ratio: float) -> None:
-        if not self._dragging:
-            self._visible_range = (start_ratio, end_ratio)
-            self.update()
+        self._visible_range = (start_ratio, end_ratio)
+        self.update()
 
     def toggle(self) -> None:
         """带动画的显示/隐藏切换"""
@@ -289,16 +289,23 @@ class MinimapPanel(QWidget):
 # 缩略图生成工具
 # ═══════════════════════════════════════════════════════════
 
-def generate_thumbnails(doc, page_count: int, thumb_scale: float = 0.10) -> list[QPixmap]:
-    """从 PyMuPDF Document 生成全部页面的缩略图 QPixmap 列表"""
-    import fitz
+def generate_thumbnails(doc: QPdfDocument, page_count: int, thumb_scale: float = 0.10) -> list[QPixmap]:
+    """从 QPdfDocument 生成全部页面的缩略图 — 白色底板"""
+    from PySide6.QtGui import QPainter
     thumbnails: list[QPixmap] = []
-    mat = fitz.Matrix(thumb_scale, thumb_scale)
+    white = QColor("#ffffff")
     for i in range(page_count):
-        pix = doc[i].get_pixmap(matrix=mat)
-        img = QImage(
-            pix.samples, pix.width, pix.height, pix.stride,
-            QImage.Format.Format_RGB888,
-        )
-        thumbnails.append(QPixmap.fromImage(img.copy()))
+        size = doc.pagePointSize(i)
+        thumb_w = max(int(size.width() * thumb_scale), 20)
+        thumb_h = max(int(size.height() * thumb_scale), 14)
+        image = doc.render(i, QSize(thumb_w, thumb_h))
+        if image.isNull():
+            continue
+        # 合成到白色底板上
+        canvas = QImage(thumb_w + 4, thumb_h + 4, QImage.Format.Format_ARGB32)
+        canvas.fill(white)
+        p = QPainter(canvas)
+        p.drawImage(2, 2, image)
+        p.end()
+        thumbnails.append(QPixmap.fromImage(canvas))
     return thumbnails

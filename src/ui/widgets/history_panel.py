@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -45,7 +45,7 @@ class HistoryEntry:
 class HistoryPanel(QWidget):
     """扫描 output/ 目录，以列表展示历史翻译记录"""
 
-    result_selected = pyqtSignal(str, str, str)  # dual_path, mono_path, display_name
+    result_selected = Signal(str, str, str)  # dual_path, mono_path, display_name
 
     def __init__(self, output_dir: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -86,7 +86,6 @@ class HistoryPanel(QWidget):
         self._list = QListWidget()
         self._list.setAlternatingRowColors(False)
         self._list.setSpacing(2)
-        self._list.setMaximumHeight(200)
         self._list.itemClicked.connect(self._on_item_clicked)
         self._list.setStyleSheet(
             f"QListWidget {{ background: transparent; border: 1px solid {Colors.DIVIDER.name() if hasattr(Colors, 'DIVIDER') else '#2a2a30'};"

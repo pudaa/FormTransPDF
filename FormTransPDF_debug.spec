@@ -20,7 +20,7 @@ _PROJECT_ROOT = Path(SPECPATH).resolve()
 _COLLECT_ALL_PACKAGES = [
     "pdf2zh_next",
     "babeldoc",
-    "PyQt6",
+    "PySide6",
     "bitstring",
     "hyperscan",
     "tiktoken",         # pkgutil.iter_modules 动态发现 tiktoken_ext 命名空间插件
@@ -33,6 +33,9 @@ _HIDDEN_IMPORTS = [
     "multiprocessing",
     "multiprocessing.pool",
     "multiprocessing.popen_spawn_win32",
+    # PySide6 QtPdf（QtPdf 插件）
+    "PySide6.QtPdf",
+    "PySide6.QtPdfWidgets",
 ]
 
 # ── 应用自身数据文件 ────────────────────────────────────

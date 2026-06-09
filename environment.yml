@@ -7,6 +7,5 @@ dependencies:
   - pip
   - pip:
       - pdf2zh-next>=2.8.0
-      - PyQt6>=6.5.0
+      - PySide6>=6.5.0
       - qasync>=0.27.0
-      - PyMuPDF>=1.23.0

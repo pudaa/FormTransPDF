@@ -14,8 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -36,7 +36,7 @@ def _resolve_font(family: str, fallback: str) -> str:
 def create_display_font(size: int = 28, weight: int = 600) -> QFont:
     family = _resolve_font(FONT_DISPLAY, FONT_CJK)
     font = QFont(family, size)
-    font.setWeight(weight)
+    font.setWeight(QFont.Weight(weight))
     font.setStyleHint(QFont.StyleHint.Serif)
     return font
 
@@ -44,7 +44,7 @@ def create_display_font(size: int = 28, weight: int = 600) -> QFont:
 def create_body_font(size: int = 11, weight: int = 400) -> QFont:
     family = _resolve_font(FONT_BODY, FONT_CJK)
     font = QFont(family, size)
-    font.setWeight(weight)
+    font.setWeight(QFont.Weight(weight))
     font.setStyleHint(QFont.StyleHint.SansSerif)
     return font
 
