@@ -281,12 +281,29 @@ class PDFViewer(QScrollArea):
         self._doc = None
 
     def zoom_in(self) -> None:
+        if self._fit_width:
+            self._scale = self._effective_display_scale()
         self._fit_width = False
         self._set_zoom(self._scale + 0.3)
 
     def zoom_out(self) -> None:
+        if self._fit_width:
+            self._scale = self._effective_display_scale()
         self._fit_width = False
         self._set_zoom(self._scale - 0.3)
+
+    def _effective_display_scale(self) -> float:
+        """计算当前自适应宽度对应的等效缩放比（相对 PDF 页面尺寸）。
+
+        从 fit-width 切换为手动缩放时，以此作为基准避免跳跃。
+        """
+        if not self._pages:
+            return 1.0
+        pw = self._pages[0]
+        src = pw._source_image
+        if src is None:
+            return 1.0
+        return pw.width() * pw._source_scale / max(src.width(), 1)
 
     def zoom_reset(self) -> None:
         """重置为自适应宽度"""

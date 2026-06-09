@@ -31,7 +31,7 @@ TRANSLATOR_OPTIONS: dict[str, dict] = {
     },
     "deepseek": {
         "label": "DeepSeek", "needs_key": True, "needs_model": True,
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "models": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
     },
     "deepl": {
         "label": "DeepL", "needs_key": True, "needs_model": False,

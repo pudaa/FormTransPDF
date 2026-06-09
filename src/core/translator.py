@@ -44,6 +44,12 @@ class TranslationEngine:
         settings.translation.lang_in = task.lang_in
         settings.translation.lang_out = task.lang_out
 
+        # -- 性能优化：关闭自动术语提取，避免 LLM JSON 解析错误带来的重试开销 --
+        #    自动术语提取在控制台输出中频繁报错（JSON 解析失败），
+        #    每次错误都会触发 fallback 重试，拖慢整体翻译速度。
+        #    如需术语表，可后期通过专门工具生成。
+        settings.translation.no_auto_extract_glossary = True
+
         # -- 翻译引擎设置 --
         ts = settings.translate_engine_settings
         svc = task.translator.lower()

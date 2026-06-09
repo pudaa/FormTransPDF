@@ -154,7 +154,6 @@ class MainWindow(QMainWindow):
         self._minimap = MinimapPanel(self._viewer)
         self._minimap.page_clicked.connect(self._on_minimap_page_clicked)
         self._minimap.viewport_dragged.connect(self._on_minimap_dragged)
-
         root.addWidget(main_area, stretch=1)
 
     # ── 侧边栏 ───────────────────────────────────────────────
@@ -246,7 +245,7 @@ class MainWindow(QMainWindow):
 
         # 缩略图切换
         self._minimap_btn = self._make_icon_btn("▦", "切换缩略图导航", width=38)
-        self._minimap_btn.clicked.connect(lambda: self._minimap and self._minimap.toggle())
+        self._minimap_btn.clicked.connect(lambda: self._minimap and self._minimap.toggle()) # 点击时切换缩略图导航
         layout.addWidget(self._minimap_btn)
 
         # 分隔
@@ -403,6 +402,11 @@ class MainWindow(QMainWindow):
         self._sidebar_visible = not self._sidebar_visible
         self._sidebar.setVisible(self._sidebar_visible)
         self._sidebar_sep.setVisible(self._sidebar_visible)
+        # 侧边栏展开/收起后 viewer 视口宽度变化，需重定位 minimap
+        # 用 singleShot 延迟到布局完成后再计算位置
+        if self._minimap and self._minimap.isVisible():
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._position_minimap)
 
     def _update_zoom_label(self) -> None:
         if self._viewer.is_fit_width:
@@ -588,7 +592,7 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════
 
     def _setup_minimap(self) -> None:
-        """为当前 PDF 生成缩略图并加载到 minimap"""
+        """为当前 PDF 生成缩略图并加载到 minimap（默认隐藏，通过按钮唤起）"""
         doc = self._viewer.document
         if doc is None:
             return
@@ -596,7 +600,7 @@ class MainWindow(QMainWindow):
             thumbs = generate_thumbnails(doc, self._viewer.page_count)
             self._minimap.load_document(self._viewer.page_count, thumbs)
             self._position_minimap()
-            self._minimap.show()
+            # 默认隐藏，用户通过 ▦ 按钮切换显示
             # 监听滚动条变化，同步视口指示器
             self._viewer.verticalScrollBar().valueChanged.connect(
                 self._update_minimap_viewport
