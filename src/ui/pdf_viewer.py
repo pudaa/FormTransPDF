@@ -62,10 +62,13 @@ class PDFViewer(QWidget):
         self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
         self._stack.addWidget(self._pdf_view)  # index 1
 
-        # 中键拖拽 — 事件过滤器（避免覆盖 QPdfView 自身事件）
+        # 事件过滤器：
+        #   - QPdfView 本体：拦截 Ctrl+滚轮（在 QPdfView 内部处理之前）
+        #   - viewport：拦截中键拖拽
         self._panning = False
         self._pan_start: QPoint | None = None
         self._pan_scroll_start: QPoint | None = None
+        self._pdf_view.installEventFilter(self)
         self._pdf_view.viewport().installEventFilter(self)
         self._pdf_view.viewport().setMouseTracking(True)
 
@@ -176,20 +179,35 @@ class PDFViewer(QWidget):
         self._doc = None
         self._stack.setCurrentIndex(0)
 
-    def zoom_in(self) -> None:
-        if self._fit_width:
-            self._fit_width = False
-            self._scale = 1.0
-        self._scale = min(self._scale * 1.25, self.MAX_SCALE)
+    def _exit_fit_width(self) -> float:
+        """从 FitToWidth 切换到 Custom 模式，返回视觉缩放比。
+
+        QPdfView 在 FitToWidth 下 zoomFactor() 恒为 1.0，
+        因此需从 viewport/page 几何计算真实视觉缩放比。
+        """
+        if not self._fit_width:
+            return self._scale
+        self._fit_width = False
         self._pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
+        # 计算真实视觉缩放
+        vp_w = max(self._pdf_view.viewport().width(), 1)
+        if self._doc and self._doc.pageCount() > 0:
+            pt_w = max(self._doc.pagePointSize(0).width(), 1)
+            visual_scale = vp_w / pt_w
+        else:
+            visual_scale = 1.0
+        self._scale = visual_scale
+        self._pdf_view.setZoomFactor(visual_scale)
+        return visual_scale
+
+    def zoom_in(self) -> None:
+        self._scale = self._exit_fit_width()
+        self._scale = min(self._scale * 1.25, self.MAX_SCALE)
         self._pdf_view.setZoomFactor(self._scale)
 
     def zoom_out(self) -> None:
-        if self._fit_width:
-            self._fit_width = False
-            self._scale = 1.0
+        self._scale = self._exit_fit_width()
         self._scale = max(self._scale / 1.25, self.MIN_SCALE)
-        self._pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
         self._pdf_view.setZoomFactor(self._scale)
 
     def zoom_reset(self) -> None:
