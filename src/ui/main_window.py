@@ -147,10 +147,10 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self._viewer, stretch=1)
 
         # 缩略图导航（覆盖在 PDF 查看器右上角）
-        self._minimap = MinimapPanel(self._viewer)
+        self._minimap = MinimapPanel(self._viewer) # 缩略图导航
         self._minimap.page_clicked.connect(self._on_minimap_page_clicked)
         self._minimap.viewport_dragged.connect(self._on_minimap_dragged)
-        root.addWidget(main_area, stretch=1)
+        root.addWidget(main_area, stretch=1) # 主内容区域
 
     # ── 侧边栏 ───────────────────────────────────────────────
 

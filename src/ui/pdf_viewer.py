@@ -47,16 +47,19 @@ class PDFViewer(QWidget):
         # ── StackedLayout ──
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         self._stack = QStackedLayout()
+        self._stack.setContentsMargins(0, 0, 0, 0)
+        self._stack.setSpacing(0)
         root.addLayout(self._stack)
 
-        # ① placeholder
+        # ① placeholder 空状态提示
         self._placeholder = QLabel("拖拽 PDF 文件到此处")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._stack.addWidget(self._placeholder)  # index 0
 
-        # ② QPdfView
+        # ② QPdfView 渲染区域
         self._pdf_view = QPdfView()
         self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
         self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
@@ -78,39 +81,33 @@ class PDFViewer(QWidget):
     # ── 样式 ────────────────────────────────────────────────
 
     def _apply_bg_style(self) -> None:
-        bg = Colors.SLATE.name()
+        white = "#ffffff"
         text = Colors.CHAR.name()
-        # PDFViewer 自身背景
-        self.setStyleSheet(f"background-color: {bg};")
-        # placeholder
+        self.setStyleSheet(f"background-color: {white}; border: none;")
         self._placeholder.setStyleSheet(
             f"color: {text}; font-size: 14pt; font-style: italic;"
-            f"background-color: {bg}; padding: 80px;"
+            f"background-color: {white}; padding: 80px; border: none;"
         )
-        # QPdfView (QAbstractScrollArea) — stylesheet 控制 frame + palette 透传 viewport
-        self._pdf_view.setAutoFillBackground(True)
         self._pdf_view.setStyleSheet(
-            f"QAbstractScrollArea {{ background-color: {bg}; border: none; }}"
+            f"QPdfView {{ background-color: {white}; border: none; }}"
         )
-        pal = self._pdf_view.palette()
-        pal.setColor(QPalette.ColorRole.Window, QColor(bg))
-        pal.setColor(QPalette.ColorRole.Base, QColor(bg))
-        self._pdf_view.setPalette(pal)
 
-    def _force_viewport_bg(self) -> None:
-        """强制设置 viewport 背景（document 加载后调用）"""
-        bg = Colors.SLATE.name()
+
+    def _final_bg_check(self) -> None:
+        """最终检查并强制背景色"""
+        white = "#ffffff"
         vp = self._pdf_view.viewport()
-        vp.setAutoFillBackground(True)
-        pal = vp.palette()
-        pal.setColor(QPalette.ColorRole.Base, QColor(bg))
-        pal.setColor(QPalette.ColorRole.Window, QColor(bg))
-        vp.setPalette(pal)
-        vp.update()
+        if vp:
+            pal_vp = vp.palette()
+            current_bg = pal_vp.color(QPalette.ColorRole.Window)
+            if current_bg.name() != white:
+                pal_vp.setColor(QPalette.ColorRole.Window, QColor(white))
+                pal_vp.setColor(QPalette.ColorRole.Base, QColor(white))
+                vp.setPalette(pal_vp)
+                vp.update()
 
     def refresh_theme(self) -> None:
         self._apply_bg_style()
-        self._force_viewport_bg()
 
     # ── properties ──────────────────────────────────────────
 
@@ -146,31 +143,23 @@ class PDFViewer(QWidget):
     # ── 公开方法 ────────────────────────────────────────────
 
     def load_pdf(self, path: str) -> None:
-        # ① 保留旧文档引用，防止 GC 在 QPdfView 切换期间回收
         old_doc = self._doc
-        # ② 创建并加载新文档
         self._doc = QPdfDocument()
         self._doc.load(path)
         if self._doc.status() != QPdfDocument.Status.Ready:
             self._doc = None
-            # 加载失败时确保 QPdfView 与内部状态一致
             if old_doc is None:
-                # 首次加载失败：无旧文档可回退，解除 QPdfView 引用
                 self._pdf_view.setDocument(None)
             self._stack.setCurrentIndex(0)
             return
 
         self._fit_width = True
         self._scale = self.DEFAULT_SCALE
-        # ③ setDocument 内部自动断开旧文档，避免手动 setDocument(None)
         self._pdf_view.setDocument(self._doc)
         self._pdf_view.setDocumentMargins(QMargins(0, 0, 0, 0))
         self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
         self._stack.setCurrentIndex(1)
 
-        # 强制 viewport 背景
-        self._force_viewport_bg()
-        # ④ 旧文档安全释放
         del old_doc
 
     def clear(self) -> None:
