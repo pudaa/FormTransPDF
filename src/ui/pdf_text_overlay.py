@@ -15,8 +15,10 @@ from typing import List, Optional
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QPushButton, QGraphicsDropShadowEffect
 )
-from PySide6.QtCore import Qt, QRectF, QPoint, QSize, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QPainter, QColor, QPen, QFont, QIcon
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QPainter, QColor
+
+from src.ui.theme import theme_manager
 
 
 class TextOverlay(QWidget):
@@ -45,25 +47,14 @@ class TextOverlay(QWidget):
         return self._toolbar
 
     def set_highlights(self, rects: List[QRectF]):
-        """设置高亮矩形列表"""
+        """设置高亮矩形列表（仅更新绘制，不控制工具栏）"""
         self._highlights = rects
         self.update()
 
-        # 显示/隐藏工具栏
-        if rects:
-            self._show_toolbar_at_selection(rects)
-        else:
-            self._toolbar.hide()
-
-    def clear_highlights(self):
-        """清除所有高亮和工具栏"""
-        self._highlights.clear()
-        self._toolbar.hide()
-        self.update()
-
-    def _show_toolbar_at_selection(self, rects: List[QRectF]):
-        """在选区上方显示浮动工具栏"""
+    def show_toolbar_at(self, rects: List[QRectF]):
+        """在选区上方显示浮动工具栏（仅在鼠标松开时调用）"""
         if not rects:
+            self._toolbar.hide()
             return
 
         # 计算选区的包围矩形
@@ -71,31 +62,34 @@ class TextOverlay(QWidget):
         for r in rects[1:]:
             united = united.united(r)
 
-        # 工具栏位置：选区上方居中
         toolbar_w = self._toolbar.sizeHint().width()
         toolbar_h = self._toolbar.sizeHint().height()
         x = int(united.center().x() - toolbar_w / 2)
-        y = int(united.top() - toolbar_h - 8)  # 上方 8px 间距
+        y = int(united.top() - toolbar_h - 8)
 
-        # 边界检查：不要超出 viewport
+        # 边界检查
         vp_w = self.width()
         x = max(8, min(x, vp_w - toolbar_w - 8))
-        y = max(8, y)  # 顶部留出边距
+        y = max(8, y)
 
         self._toolbar.move(x, y)
         self._toolbar.show()
         self._toolbar.raise_()
 
+    def clear_highlights(self):
+        """清除所有高亮和工具栏"""
+        self._highlights.clear()
+        self._toolbar.hide()
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # 绘制已选高亮（唯一必须的可视反馈）
         if self._highlights:
-            painter.setBrush(QColor(0, 120, 255, 50))  # 蓝色半透明
+            painter.setBrush(QColor(0, 120, 255, 50))
             painter.setPen(Qt.NoPen)
             for rect in self._highlights:
-                # 稍微扩展一点，让高亮更明显
                 expanded = rect.adjusted(-1, -1, 1, 1)
                 painter.drawRoundedRect(expanded, 2, 2)
 
@@ -103,85 +97,59 @@ class TextOverlay(QWidget):
 
 
 class FloatingToolbar(QWidget):
-    """浮动工具栏 — 选中后弹出"""
+    """浮动工具栏 — 选中后弹出，显示在选区上方"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.ToolTip)  # 不接收焦点，不抢夺事件
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # 确保工具栏有独立的不透明背景
+        self.setAutoFillBackground(True)
 
-        # 样式
-        self.setStyleSheet("""
-            FloatingToolbar {
-                background-color: #2d2d2d;
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QPushButton {
+        # 修复：使用高对比度配色，不依赖主题
+        # 暖象牙色背景 + 深墨色文字，在任何主题下都清晰可读
+        bg = "#f5e6c8"           # 暖象牙色
+        bg_hover = "#e8d4a8"     # 悬浮色
+        border_color = "#d4a853"  # 金色边框
+        fg = "#2c2416"           # 深墨色文字
+        shadow_color = QColor(0, 0, 0, 60)  # 降低阴影透明度
+
+        self.setStyleSheet(f"""
+            FloatingToolbar {{
+                background-color: {bg};
+                border: 1.5px solid {border_color};
+                border-radius: 6px;
+            }}
+            QPushButton {{
                 background-color: transparent;
-                color: white;
+                color: {fg};
                 border: none;
-                border-radius: 4px;
-                padding: 6px 12px;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #404040;
-            }
-            QPushButton:pressed {
-                background-color: #505050;
-            }
+                border-radius: 3px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: {bg_hover};
+            }}
         """)
 
-        # 阴影效果
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(16)
-        shadow.setColor(QColor(0, 0, 0, 80))
-        shadow.setOffset(0, 4)
+        shadow.setBlurRadius(8)
+        shadow.setColor(shadow_color)
+        shadow.setOffset(0, 2)
         self.setGraphicsEffect(shadow)
 
-        # 布局
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(2)
 
-        # 复制按钮
-        self.copy_btn = QPushButton("\U0001F4CB 复制")
-        self.copy_btn.setToolTip("复制选中文本 (Ctrl+C)")
+        self.copy_btn = QPushButton("📋 复制")
+        self.copy_btn.setToolTip("复制到剪贴板")
         layout.addWidget(self.copy_btn)
 
-        # 搜索按钮
-        self.search_btn = QPushButton("\U0001F50D 搜索")
-        self.search_btn.setToolTip("搜索选中文本")
-        layout.addWidget(self.search_btn)
-
-        # 高亮按钮
-        self.highlight_btn = QPushButton("\U0001F58D\uFE0F 标记")
-        self.highlight_btn.setToolTip("添加永久高亮")
-        layout.addWidget(self.highlight_btn)
-
-        # 关闭按钮
-        self.close_btn = QPushButton("\u2715")
-        self.close_btn.setToolTip("关闭")
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setToolTip("取消选择")
         self.close_btn.setFixedWidth(28)
         layout.addWidget(self.close_btn)
 
         self.setFixedSize(self.sizeHint())
-
-        # 入场动画
-        self._anim = QPropertyAnimation(self, b"windowOpacity")
-        self._anim.setDuration(150)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
-
-    def showEvent(self, event):
-        """重写 showEvent 实现淡入动画"""
-        self.setWindowOpacity(0.0)
-        self._anim.setStartValue(0.0)
-        self._anim.setEndValue(1.0)
-        self._anim.start()
-
-    def hide(self):
-        self._anim.setStartValue(1.0)
-        self._anim.setEndValue(0.0)
-        self._anim.finished.connect(super().hide)
-        self._anim.start()

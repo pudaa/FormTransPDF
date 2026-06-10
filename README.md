@@ -4,7 +4,7 @@
 
 ![FormTransPDF](https://img.shields.io/badge/FormTransPDF-v0.1.0-d4a853?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python)
-![PyQt6](https://img.shields.io/badge/PyQt-6-41CD52?style=flat-square&logo=qt)
+![PySide6](https://img.shields.io/badge/PySide-6-41CD52?style=flat-square&logo=qt)
 ![License](https://img.shields.io/badge/License-MIT-8a8578?style=flat-square)
 
 **PDF 科学论文翻译查看器 — 基于 pdf2zh-next**
@@ -140,12 +140,12 @@ git push
 ## 技术栈
 
 | 层 | 技术 |
-|----|------|
+| ----- | ----- |
 | 翻译引擎 | [pdf2zh-next](https://github.com/funstory-ai/BabelDOC) (BabelDOC) |
-| UI 框架 | PyQt6 |
+| UI 框架 | PySide6 |
 | 异步桥接 | qasync |
-| PDF 渲染 | PyMuPDF (fitz) |
+| PDF 渲染 | QpdfView |
 
 ## License
 
-MIT
+MIT License © 2024 [FunStory AI](https://funstory.ai)

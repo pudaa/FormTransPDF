@@ -36,12 +36,25 @@ class PdfLayoutEngine:
 
     def __init__(self, pdf_view: QPdfView):
         self._pdf_view = pdf_view
+        self._pdf_view.setDocumentMargins(QMargins(0, 0, 0, 0))
+        
         self._doc: Optional[QPdfDocument] = None
+        
 
     def set_document(self, doc: Optional[QPdfDocument]):
         self._doc = doc
 
-    def compute_layout(self, viewport_width: int, viewport_height: int) -> List[PageLayout]:
+    def compute_layout(self, viewport_width: int, viewport_height: int,
+                       explicit_scale: float | None = None) -> List[PageLayout]:
+        """计算页面布局。
+
+        Args:
+            explicit_scale: 显式指定缩放比（像素/点）。
+
+        页面 x 位置基于 viewport_width 居中，与 QPdfView 内部行为一致。
+        QPdfView 在 MultiPage 模式下对每页独立在视口中居中，页面宽度变化时
+        x 位置随之调整。
+        """
         if not self._doc or self._doc.pageCount() == 0:
             return []
 
@@ -57,7 +70,7 @@ class PdfLayoutEngine:
             current_page = self._pdf_view.pageNavigator().currentPage()
             if 0 <= current_page < self._doc.pageCount():
                 pt_size = self._doc.pagePointSize(current_page)
-                scale = self._compute_scale(
+                scale = explicit_scale if explicit_scale is not None else self._compute_scale(
                     zoom_mode, zoom_factor, viewport_width, viewport_height,
                     margins, pt_size.width(), pt_size.height()
                 )
@@ -67,19 +80,25 @@ class PdfLayoutEngine:
                 y = margins.top()
                 layouts.append(PageLayout(current_page, QRectF(x, y, page_w, page_h), scale))
         else:
-            # MultiPage 垂直排列
-            y_offset = margins.top()
-            for i in range(self._doc.pageCount()):
-                pt_size = self._doc.pagePointSize(i)
-                scale = self._compute_scale(
+            # ── MultiPage 垂直排列 ──
+            all_pt = [self._doc.pagePointSize(i) for i in range(self._doc.pageCount())]
+            if explicit_scale is not None:
+                unified_scale = explicit_scale
+            else:
+                first_pt = all_pt[0]
+                unified_scale = self._compute_scale(
                     zoom_mode, zoom_factor, viewport_width, viewport_height,
-                    margins, pt_size.width(), pt_size.height()
+                    margins, first_pt.width(), first_pt.height()
                 )
-                page_w = pt_size.width() * scale
-                page_h = pt_size.height() * scale
+
+            y_offset = margins.top()
+            for i, pt_size in enumerate(all_pt):
+                page_w = pt_size.width() * unified_scale
+                page_h = pt_size.height() * unified_scale
+                # 基于 viewport_width 居中，与 QPdfView 一致
                 x = max((viewport_width - page_w) / 2, margins.left())
 
-                layouts.append(PageLayout(i, QRectF(x, y_offset, page_w, page_h), scale))
+                layouts.append(PageLayout(i, QRectF(x, y_offset, page_w, page_h), unified_scale))
                 y_offset += page_h + page_spacing
 
         return layouts
