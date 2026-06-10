@@ -35,29 +35,27 @@ class FormTransPDFApp(QApplication):
         if argv is None:
             argv = sys.argv
 
+        # ── Windows 任务栏图标：必须在 QApplication 创建之前设置 AppUserModelID ──
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "FormTransPDF.FormTransPDF"
+                )
+            except Exception:
+                pass
+
         super().__init__(argv)
 
         self.setApplicationName(__app_name__)
         self.setApplicationVersion(__version__)
         self.setOrganizationName("FormTransPDF")
 
-        # ── 应用图标（Windows 任务栏/标题栏）──
-        self._setup_windows_taskbar()
+        # ── 应用图标 ──
         self._set_app_icon()
 
         self._theme_manager = ThemeManager()
         self._apply_theme()
-        
-    def _setup_windows_taskbar(self) -> None:
-        """设置 Windows 任务栏 AppUserModelID，确保图标正确显示"""
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                # 设置唯一的 AppUserModelID
-                app_id = f"FormTransPDF.FormTransPDF.{__version__}"
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
-            except Exception as e:
-                logger.warning(f"Failed to set Windows AppUserModelID: {e}")
 
 
 
