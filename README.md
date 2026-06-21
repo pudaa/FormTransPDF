@@ -23,23 +23,24 @@
 
 | 主题 | 名称 | 理念 |
 |------|------|------|
-| 🌙 暗色 | **Gilded Ink**（鎏金墨韵） | Warm Industrial × Scholarly Editorial |
-| ☀ 亮色 | **Vellum**（羊皮纸） | Warm Academic × Manuscript |
+| 暗色 | **Gilded Ink**（鎏金墨韵） | Warm Industrial × Scholarly Editorial |
+| 亮色 | **Vellum**（羊皮纸） | Warm Academic × Manuscript |
 
 - **字体**: Cormorant Garamond（标题）/ IBM Plex Sans（正文）
-- **主题切换**: 顶栏 ☀/🌙 按钮一键切换
+- **主题切换**: 顶栏一键切换暗色/亮色主题
 
 ## 功能
 
-- 📄 **单窗口 PDF 查看**: 标签切换原始 / 译文，全宽渲染
-- 🌐 **16+ 翻译服务**: OpenAI, DeepSeek, DeepL, Google, Ollama, 智谱...
-- 🖱️ **拖拽加载**: 拖入 PDF 立即查看
-- 📊 **实时进度**: 逐页进度条
-- 🔍 **真缩放**: Ctrl+滚轮（30%~800%）/ 自适应宽度
-- 💾 **设置持久化**: 自动保存翻译配置
-- 📋 **模型下拉**: 切换服务自动加载常用模型
-- ⬇ **下载译文**: 保存翻译结果 PDF
-- 📁 **可收起侧边栏**: 点击 ☰ 释放空间
+- **单窗口 PDF 查看**: 标签切换原始 / 译文，全宽渲染
+- **16+ 翻译服务**: OpenAI, DeepSeek, DeepL, Google, Ollama, 智谱...
+- **拖拽加载**: 拖入 PDF 立即查看
+- **实时进度**: 逐页进度条
+- **缩放**: Ctrl+滚轮（30%~800%）/ 自适应宽度
+- **设置持久化**: 自动保存翻译配置
+- **模型下拉**: 切换服务自动加载常用模型
+- **下载译文**: 保存翻译结果 PDF
+- **可收起侧边栏**: 点击菜单按钮释放空间
+- **即时翻译浮窗**: 选中文本弹出，支持 Esc 关闭、拖拽关闭、自动定位右下角
 
 ## 关于翻译速度
 
@@ -47,7 +48,7 @@
 
 ## 项目结构
 
-```
+```text
 FormTransPDF/
 ├── src/
 │   ├── main.py / app.py     # 入口 + QApplication
@@ -82,7 +83,7 @@ pip install -r requirements.txt
 至少配置一个翻译服务的 API Key。支持通过环境变量设置：
 
 | 服务 | 环境变量 |
-|------|----------|
+| ------ | ---------- |
 | OpenAI | `OPENAI_API_KEY` |
 | DeepSeek | `DEEPSEEK_API_KEY` |
 | DeepL | `DEEPL_API_KEY` |
@@ -100,12 +101,12 @@ python -m src.main
 
 ## 使用流程
 
-1. 拖拽 PDF 到窗口（或点击「📂 选择」）
+1. 拖拽 PDF 到窗口（或点击「选择」按钮）
 2. 选择翻译服务、填写 API Key、选模型
 3. 选择源语言 / 目标语言
-4. 点击「🚀 翻译」
+4. 点击「翻译」
 5. 完成后自动切换译文标签
-6. 点击「⬇ 下载译文」保存
+6. 点击「下载译文」保存
 
 ## 打包为 EXE
 
@@ -126,7 +127,7 @@ pyinstaller FormTransPDF.spec
 cd d:\Codes\FormTransPDF
 git init
 git add .
-git commit -m "feat: FormTransPDF v0.1.0 — PyQt6 PDF translation viewer"
+git commit -m "feat: FormTransPDF v0.1.0 — PySide6 PDF translation viewer"
 
 # 3. 关联远程仓库
 git remote add origin https://github.com/<你的用户名>/FormTransPDF.git
