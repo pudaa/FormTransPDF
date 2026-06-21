@@ -4,6 +4,7 @@
   <img src="src/resources/icons/app.png" alt="FormTransPDF Logo" width="128" height="128">
 </div>
 
+<div align="center">
 ![FormTransPDF](https://img.shields.io/badge/FormTransPDF-v0.1.0-d4a853?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python)
 ![PySide6](https://img.shields.io/badge/PySide-6-41CD52?style=flat-square&logo=qt)
