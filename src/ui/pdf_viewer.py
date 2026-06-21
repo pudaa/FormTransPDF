@@ -330,7 +330,9 @@ class PDFViewer(QWidget):
 
         vp = self._pdf_view.viewport()
         scale = self._current_scale()
-        layouts = self._layout_engine.compute_layout(vp.width(), vp.height(), explicit_scale=scale)
+        layouts = self._layout_engine.compute_layout(
+            vp.width(), vp.height(), explicit_scale=scale
+        )
 
         # ── 诊断：对比引擎计算的 content 尺寸与 QPdfView 实际 scrollbar ──
         self._diagnose_layout(layouts, vp)
@@ -372,18 +374,18 @@ class PDFViewer(QWidget):
         max_w = max(l.rect.right() + margins.right() for l in layouts)
         qpdf_width = self.horizontalScrollBar().maximum() + vp.width()
 
-        # 只在差异较大时打印（避免滚动时刷屏）
+        # 只在差异显著时打印（诊断用，正常情况差异 < 30px）
         h_diff = abs(our_height - qpdf_height)
         w_diff = abs(max_w - qpdf_width)
-        # if h_diff > 2 or w_diff > 2:
-        #     print(
-        #         f"[Layout 诊断] scale={self._current_scale():.3f} fit_width={self._fit_width} "
-        #         f"vp=({vp.width()},{vp.height()}) "
-        #         f"我们的 content=({max_w:.0f},{our_height:.0f}) "
-        #         f"QPdfView content=({qpdf_width:.0f},{qpdf_height:.0f}) "
-        #         f"差异=({w_diff:.0f},{h_diff:.0f}) "
-        #         f"margins=({margins.left()},{margins.top()},{margins.right()},{margins.bottom()})"
-        #     )
+        if h_diff > 50 or w_diff > 50:
+            print(
+                f"[Layout 诊断] scale={self._current_scale():.3f} fit_width={self._fit_width} "
+                f"vp=({vp.width()},{vp.height()}) "
+                f"我们的 content=({max_w:.0f},{our_height:.0f}) "
+                f"QPdfView content=({qpdf_width:.0f},{qpdf_height:.0f}) "
+                f"差异=({w_diff:.0f},{h_diff:.0f}) "
+                f"margins=({margins.left()},{margins.top()},{margins.right()},{margins.bottom()})"
+            )
 
     def _sync_overlay_geometry(self):
         """保证覆盖层始终覆盖整个 viewport"""

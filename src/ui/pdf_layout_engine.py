@@ -49,11 +49,12 @@ class PdfLayoutEngine:
         """计算页面布局。
 
         Args:
-            explicit_scale: 显式指定缩放比（像素/点）。
+            explicit_scale: 显式指定缩放比（物理像素/点）。
+
+        pageSpacing 是原始物理像素值，QPdfView 不对其应用 DPI 缩放
+        （与 zoomFactor 不同，后者会被解释为 72DPI 逻辑像素再乘 DPI 比率）。
 
         页面 x 位置基于 viewport_width 居中，与 QPdfView 内部行为一致。
-        QPdfView 在 MultiPage 模式下对每页独立在视口中居中，页面宽度变化时
-        x 位置随之调整。
         """
         if not self._doc or self._doc.pageCount() == 0:
             return []
