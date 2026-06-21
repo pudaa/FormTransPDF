@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from src.core.signals import TranslationEvent, TranslationTask, TranslationSignals
 from src.core.translator import TranslationEngine
+from src.ui.quick_translate_dialog import QuickTranslateDialog
 from src.ui.pdf_viewer import PDFViewer
 from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
         self._engine = TranslationEngine()
         self._minimap: MinimapPanel | None = None  # 在 _build_ui 中创建
         self._minimap_synced = False  # 滚动条信号是否已连接
+        self._quick_translate_dialog: QuickTranslateDialog | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -144,6 +146,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self._tab_bar)
 
         self._viewer = PDFViewer()
+        self._viewer.text_selected.connect(self._on_text_selected)
         main_layout.addWidget(self._viewer, stretch=1)
 
         # 缩略图导航（覆盖在 PDF 查看器右上角）
@@ -247,6 +250,10 @@ class MainWindow(QMainWindow):
         self._minimap_btn.clicked.connect(lambda: self._minimap and self._minimap.toggle()) # 点击时切换缩略图导航
         layout.addWidget(self._minimap_btn)
 
+        self._translate_quick_btn = self._make_icon_btn("译", "即时翻译选中文本", width=38)
+        self._translate_quick_btn.clicked.connect(self._open_quick_translate)
+        layout.addWidget(self._translate_quick_btn)
+
         # 分隔
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
@@ -304,7 +311,7 @@ class MainWindow(QMainWindow):
             f"  color: {_contrast_text(tp.accent_press).name()};"
             f"}}"
         )
-        for btn in [self._toggle_btn, self._theme_btn, self._minimap_btn]:
+        for btn in [self._toggle_btn, self._theme_btn, self._minimap_btn, self._translate_quick_btn]:
             btn.setStyleSheet(icon_btn_style)
         if hasattr(self, "_zoom_btns"):
             for btn in self._zoom_btns:
@@ -383,6 +390,9 @@ class MainWindow(QMainWindow):
 
         # 更新主题按钮图标
         self._theme_btn.setText("☀" if theme_manager.is_dark else "🌙")
+
+        if self._quick_translate_dialog:
+            self._quick_translate_dialog.refresh_theme()
 
         # 更新 PDF 容器背景
         self._viewer.refresh_theme()
@@ -568,6 +578,24 @@ class MainWindow(QMainWindow):
         self._progress.setMaximum(event.total)
         self._progress.setValue(event.current)
         self._settings.set_status(event.message)
+
+    def _open_quick_translate(self) -> None:
+        if self._quick_translate_dialog is None:
+            self._quick_translate_dialog = QuickTranslateDialog(self)
+        self._quick_translate_dialog.set_profile(self._settings.translation_profile())
+        self._quick_translate_dialog.refresh_theme()
+        self._quick_translate_dialog._position_bottom_right()
+        self._quick_translate_dialog.show()
+        self._quick_translate_dialog.raise_()
+        self._quick_translate_dialog.activateWindow()
+
+    def _on_text_selected(self, text: str) -> None:
+        if not text.strip():
+            return
+        self._open_quick_translate()
+        if self._quick_translate_dialog:
+            self._quick_translate_dialog.set_profile(self._settings.translation_profile())
+            self._quick_translate_dialog.set_source_text(text, auto_translate=True)
 
     def _on_finished(self, event: TranslationEvent) -> None:
         self._progress.setValue(self._progress.maximum())

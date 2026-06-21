@@ -310,6 +310,17 @@ class SettingsPanel(QWidget):
             output_mode=self._output_mode_combo.currentData(),
         )
 
+    def translation_profile(self) -> dict[str, str]:
+        """导出当前翻译配置，供即时翻译窗口复用。"""
+        return {
+            "translator": str(self._translator_combo.currentData() or "openai"),
+            "api_key": self._api_key_input.text().strip(),
+            "model": self._model_combo.currentText().strip(),
+            "base_url": self._base_url_input.text().strip(),
+            "lang_in": str(self._lang_in_combo.currentData() or "en"),
+            "lang_out": str(self._lang_out_combo.currentData() or "zh"),
+        }
+
     # ═══════════════════════════════════════════════════════════
     # 槽
     # ═══════════════════════════════════════════════════════════

@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ui.theme import Colors
+from src.ui.theme import Colors, theme_manager
 from src.ui.pdf_layout_engine import PdfLayoutEngine, PageLayout
 from src.ui.pdf_text_extractor import PdfTextExtractor, TextSpan
 from src.ui.pdf_text_overlay import TextOverlay
@@ -152,6 +152,20 @@ class PDFViewer(QWidget):
         )
         self._pdf_view.setStyleSheet(
             f"QPdfView {{ background-color: {white}; border: none; }}"
+        )
+
+    def refresh_theme(self) -> None:
+        """根据当前主题刷新背景色。"""
+        tp = theme_manager.palette
+        bg = tp.canvas.name()
+        text = tp.text_secondary.name()
+        self.setStyleSheet(f"background-color: {bg}; border: none;")
+        self._placeholder.setStyleSheet(
+            f"color: {text}; font-size: 14pt; font-style: italic;"
+            f"background-color: {bg}; padding: 80px; border: none;"
+        )
+        self._pdf_view.setStyleSheet(
+            f"QPdfView {{ background-color: {bg}; border: none; }}"
         )
 
     # ── properties ──────────────────────────────────────────
