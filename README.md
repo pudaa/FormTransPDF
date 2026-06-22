@@ -57,6 +57,8 @@ FormTransPDF/
 │   └── resources/icons/     # 图标（手动放置）
 ├── output/                  # 翻译输出（自动生成，已 gitignore）
 ├── FormTransPDF.spec        # PyInstaller 打包配置
+├── FormTransPDF_thin.spec   # PyInstaller 优化版配置
+├── build_nuitka.ps1         # Nuitka 打包脚本
 ├── requirements.txt
 ├── environment.yml
 └── README.md
@@ -110,13 +112,80 @@ python -m src.main
 
 ## 打包为 EXE
 
+本项目支持 **PyInstaller** 和 **Nuitka** 两种打包方式，可根据需求选择。
+
+### 快速对比
+
+| 维度 | PyInstaller (`FormTransPDF_thin.spec`) | Nuitka (`build_nuitka.ps1`) |
+|------|----------------------------------------|-----------------------------|
+| 打包速度 | **快**（1–3 分钟） | 慢（首次 15–30 分钟） |
+| 启动速度 | 中等（有 bootloader 开销） | **快**（编译为机器码） |
+| 输出体积 | ~180–220 MB（启用 UPX） | ~200–280 MB |
+| 增量构建 | 每次都完整打包 | ✅ 仅重新编译变更文件 |
+| 分发方式 | 文件夹 | 文件夹（或单文件 `-OneFile`） |
+
+### 方式一：PyInstaller（传统方案）
+
 ```bash
 pip install pyinstaller
-pyinstaller FormTransPDF.spec
+pyinstaller FormTransPDF_thin.spec
 # → dist/FormTransPDF/FormTransPDF.exe
 ```
 
 打包后输出目录自动变为 `%USERPROFILE%\FormTransPDF\output\`。
+
+可用 spec 文件：
+
+| 文件 | 说明 |
+|------|------|
+| `FormTransPDF.spec` | 标准版 |
+| `FormTransPDF_thin.spec` | **推荐** — UPX 压缩 + 排除冗余文件 |
+| `FormTransPDF_debug.spec` | 调试版（带控制台窗口） |
+
+### 方式二：Nuitka（推荐 — 启动更快）
+
+#### 前置条件（仅首次）
+
+```bash
+conda install -c conda-forge gcc      # 需要 C 编译器
+pip install nuitka
+```
+
+首次构建时，Nuitka 会自动下载配套的 MinGW64 编译器到本地缓存。
+
+#### 日常构建
+
+```powershell
+# 常规模式（推荐）
+.\build_nuitka.ps1
+# → build-nuitka/main.dist/FormTransPDF.exe
+
+# 日常开发调试（增量编译，1-5 分钟）
+.\build_nuitka.ps1 -Quick
+
+# 带控制台窗口（看日志）
+.\build_nuitka.ps1 -Console
+
+# 单文件发布
+.\build_nuitka.ps1 -OneFile
+
+# 完全重新构建
+.\build_nuitka.ps1 -Clean
+```
+
+#### 增量更新
+
+修改源码后，只需再次运行：
+
+```powershell
+.\build_nuitka.ps1 -Quick
+```
+
+Nuitka 会自动检测变更文件，仅重新编译修改的部分，速度很快。
+
+### 打包兼容说明
+
+两个打包系统互不干扰，源文件已同时兼容两者。修改代码后，你可以自由选择任一方式构建。
 
 ## 发布到 GitHub（手动步骤）
 

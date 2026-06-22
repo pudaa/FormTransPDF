@@ -59,12 +59,22 @@ class FormTransPDFApp(QApplication):
 
 
 
+    def _get_data_path(self) -> Path:
+        """获取打包后的数据文件根目录。
+
+        兼容 PyInstaller (sys._MEIPASS) 和 Nuitka (sys.executable 同级)。
+        """
+        if getattr(sys, "frozen", False):
+            # PyInstaller
+            return Path(sys._MEIPASS)
+        if hasattr(sys, "__compiled__"):
+            # Nuitka standalone
+            return Path(sys.executable).parent
+        return Path(__file__).resolve().parent
+
     def _set_app_icon(self) -> None:
         """设置应用图标 — 必须在窗口创建之前调用，Windows 任务栏才生效"""
-        if getattr(sys, "frozen", False):
-            icon_path = Path(sys._MEIPASS) / "src" / "resources" / "icons" / "app.ico"
-        else:
-            icon_path = Path(__file__).resolve().parent / "resources" / "icons" / "app.ico"
+        icon_path = self._get_data_path() / "resources" / "icons" / "app.ico"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 

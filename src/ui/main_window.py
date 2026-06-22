@@ -56,9 +56,9 @@ def _get_output_dir() -> Path:
     """获取翻译输出目录。
 
     - 开发模式：项目根目录下的 output/
-    - 打包模式（PyInstaller）：用户主目录下的 FormTransPDF/output/
+    - 打包模式（PyInstaller/Nuitka）：用户主目录下的 FormTransPDF/output/
     """
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) or hasattr(sys, "__compiled__"):
         base = Path.home() / "FormTransPDF" / "output"
     else:
         base = Path(__file__).resolve().parent.parent.parent / "output"
