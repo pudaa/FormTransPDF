@@ -59,6 +59,23 @@ class FormTransPDFApp(QApplication):
 
 
 
+    @staticmethod
+    def _is_frozen() -> bool:
+        """检测当前是否为打包（冻结）模式。"""
+        if getattr(sys, "frozen", False):
+            return True
+        if hasattr(sys, "__compiled__"):
+            return True
+        try:
+            exe_dir = Path(sys.executable).parent
+            if (exe_dir / "src").is_dir():
+                return True
+            if "build-nuitka" in exe_dir.parts or "main.dist" in exe_dir.parts:
+                return True
+        except Exception:
+            pass
+        return False
+
     def _get_data_path(self) -> Path:
         """获取打包后的数据文件根目录。
 
@@ -67,8 +84,8 @@ class FormTransPDFApp(QApplication):
         if getattr(sys, "frozen", False):
             # PyInstaller
             return Path(sys._MEIPASS)
-        if hasattr(sys, "__compiled__"):
-            # Nuitka standalone
+        if self._is_frozen():
+            # Nuitka standalone 或其他打包
             return Path(sys.executable).parent
         return Path(__file__).resolve().parent
 

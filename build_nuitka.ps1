@@ -61,7 +61,32 @@ $NuitkaArgs = @(
     "--follow-import-to=tiktoken"           # tokenizer
     "--follow-import-to=tiktoken_ext"       # tiktoken 编码插件
     "--follow-import-to=hyperscan"          # 高性能正则
-    "--follow-import-to=qasync"             # 异步桥接    "--nofollow-import-to=pymupdf"            # 避免转译巨大 C 扩展（babeldoc 依赖）    "--nofollow-import-to=PyQt6"            # 排除竞争对手
+    "--follow-import-to=qasync"             # 异步桥接
+    #
+    # ── 显式包含动态导入的 translator_impl 模块 ──
+    # pdf2zh_next 使用 importlib.import_module() 动态加载这些模块，
+    # Nuitka 静态分析无法发现，必须用 --include-module 强制纳入编译。
+    #
+    "--include-module=pdf2zh_next.translator.translator_impl.anythingllm"
+    "--include-module=pdf2zh_next.translator.translator_impl.azure"
+    "--include-module=pdf2zh_next.translator.translator_impl.azureopenai"
+    "--include-module=pdf2zh_next.translator.translator_impl.bing"
+    "--include-module=pdf2zh_next.translator.translator_impl.claudecode"
+    "--include-module=pdf2zh_next.translator.translator_impl.clitranslator"
+    "--include-module=pdf2zh_next.translator.translator_impl.deepl"
+    "--include-module=pdf2zh_next.translator.translator_impl.dify"
+    "--include-module=pdf2zh_next.translator.translator_impl.google"
+    "--include-module=pdf2zh_next.translator.translator_impl.ollama"
+    "--include-module=pdf2zh_next.translator.translator_impl.openai"
+    "--include-module=pdf2zh_next.translator.translator_impl.qwenmt"
+    "--include-module=pdf2zh_next.translator.translator_impl.siliconflow"
+    "--include-module=pdf2zh_next.translator.translator_impl.siliconflowfree"
+    "--include-module=pdf2zh_next.translator.translator_impl.tencentmechinetranslation"
+    "--include-module=pdf2zh_next.translator.translator_impl.xinference"
+    #
+    "--nofollow-import-to=pymupdf"          # babeldoc 依赖；不转译但保留 pyd（避免 OOM）
+    "--no-deployment-flag=excluded-module-usage"  # 允许运行时使用 pymupdf 原始 pyd
+    "--nofollow-import-to=PyQt6"            # 排除竞争对手
     "--nofollow-import-to=PySide6.QtQml"    # 不需要的 Qt 模块
     "--nofollow-import-to=PySide6.QtQuick"
     "--nofollow-import-to=PySide6.QtQuickWidgets"
@@ -103,8 +128,9 @@ $NuitkaArgs = @(
     "--nofollow-import-to=pip"
     "--nofollow-import-to=wheel"
     "--nofollow-import-to=pkg_resources"
-    "--no-prefer-source-code"               # 使用预编译 .pyd，避免重编译 C 扩展（如 pymupdf）
+    "--no-prefer-source-code"               # 使用预编译 .pyd，避免重编译 C 扩展
     "--output-dir=$OutputDir"
+    "--output-filename=$AppName.exe"         # 指定输出文件名
     "--jobs=8"                              # 并行编译（限制为 8，避免内存不足）
     $EntryPoint
 )
@@ -149,6 +175,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $sw.Stop()
+
+# ── 后处理：复制 pymupdf（Nuitka 无法编译其 C 扩展）──
+$distDir = "$OutputDir/main.dist"
+if (-not $OneFile -and (Test-Path $distDir)) {
+    try {
+        $pymupdfSrc = python -c "import pymupdf; print(pymupdf.__path__[0])"
+        if ($pymupdfSrc -and (Test-Path $pymupdfSrc)) {
+            $pymupdfDest = Join-Path $distDir "pymupdf"
+            Write-Host "复制 pymupdf: $pymupdfSrc -> $pymupdfDest" -ForegroundColor Yellow
+            Copy-Item -Recurse -Force $pymupdfSrc $pymupdfDest
+        }
+    } catch {
+        Write-Host "警告: 无法复制 pymupdf: $_" -ForegroundColor Yellow
+    }
+}
 
 # ── 完成 ──────────────────────────────────────────────────
 Write-Host "`n=== 构建成功！耗时: $($sw.Elapsed.TotalMinutes.ToString('0.0')) 分钟 ===" -ForegroundColor Green

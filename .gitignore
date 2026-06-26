@@ -17,6 +17,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.github/
 
 # 系统
 .DS_Store
@@ -24,6 +25,11 @@ Thumbs.db
 
 # AI
 reasonix.toml
+.reasonix/
+.codegraph/
+AGENTS.md
 
 # 打包
 nuitka-crash-report.xml
+nuitka-error.txt
+nuitka-out.txt

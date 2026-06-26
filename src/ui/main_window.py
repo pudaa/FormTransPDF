@@ -52,13 +52,36 @@ logger = logging.getLogger(__name__)
 # 输出目录（打包兼容）
 # ═══════════════════════════════════════════════════════════════
 
+def _is_frozen() -> bool:
+    """检测当前是否为打包（冻结）模式。
+
+    兼容 PyInstaller (sys.frozen) 和 Nuitka (sys.__compiled__)。
+    """
+    if getattr(sys, "frozen", False):
+        return True
+    if hasattr(sys, "__compiled__"):
+        return True
+    # 兜底：如果 exe 与 src/ 目录同级，说明是打包模式
+    try:
+        exe_dir = Path(sys.executable).parent
+        if (exe_dir / "src").is_dir():
+            # 可执行文件旁边有 src/，大概率是打包后的目录
+            return True
+        # 如果 exe 在 build-nuitka/main.dist/ 下，也是打包模式
+        if "build-nuitka" in exe_dir.parts or "main.dist" in exe_dir.parts:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _get_output_dir() -> Path:
     """获取翻译输出目录。
 
     - 开发模式：项目根目录下的 output/
     - 打包模式（PyInstaller/Nuitka）：用户主目录下的 FormTransPDF/output/
     """
-    if getattr(sys, "frozen", False) or hasattr(sys, "__compiled__"):
+    if _is_frozen():
         base = Path.home() / "FormTransPDF" / "output"
     else:
         base = Path(__file__).resolve().parent.parent.parent / "output"

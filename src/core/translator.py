@@ -17,6 +17,49 @@ from .signals import TranslationEvent, TranslationTask, TranslationSignals
 logger = logging.getLogger(__name__)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Nuitka 兼容：预导入所有动态加载的 translator_impl 模块
+# ═══════════════════════════════════════════════════════════════
+# pdf2zh_next.translator.utils 使用 importlib.import_module()
+# 动态加载 translator_impl 下的引擎模块。Nuitka 静态分析无法
+# 发现这些动态导入，因此我们需要在启动时显式导入它们，确保 Nuitka
+# 将其纳入编译，同时运行时也可通过 sys.modules 缓存直接命中。
+#
+# 这些导入在正常开发环境中无副作用（只是提前加载模块）。
+# ═══════════════════════════════════════════════════════════════
+
+def _pre_import_translator_impls() -> None:
+    """预导入所有翻译引擎实现模块（Nuitka 兼容）。"""
+    _modules = [
+        "pdf2zh_next.translator.translator_impl.anythingllm",
+        "pdf2zh_next.translator.translator_impl.azure",
+        "pdf2zh_next.translator.translator_impl.azureopenai",
+        "pdf2zh_next.translator.translator_impl.bing",
+        "pdf2zh_next.translator.translator_impl.claudecode",
+        "pdf2zh_next.translator.translator_impl.clitranslator",
+        "pdf2zh_next.translator.translator_impl.deepl",
+        "pdf2zh_next.translator.translator_impl.dify",
+        "pdf2zh_next.translator.translator_impl.google",
+        "pdf2zh_next.translator.translator_impl.ollama",
+        "pdf2zh_next.translator.translator_impl.openai",
+        "pdf2zh_next.translator.translator_impl.qwenmt",
+        "pdf2zh_next.translator.translator_impl.siliconflow",
+        "pdf2zh_next.translator.translator_impl.siliconflowfree",
+        "pdf2zh_next.translator.translator_impl.tencentmechinetranslation",
+        "pdf2zh_next.translator.translator_impl.xinference",
+    ]
+    import importlib
+    for mod_name in _modules:
+        try:
+            importlib.import_module(mod_name)
+        except Exception:
+            logger.debug("Pre-import of %s failed (not critical)", mod_name)
+
+
+# 在模块加载时执行一次预导入
+_pre_import_translator_impls()
+
+
 class TranslationEngine:
     """
     封装 pdf2zh-next 翻译流水线。
