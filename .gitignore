@@ -1,35 +1,80 @@
-# FormTransPDF 输出目录（翻译生成的临时文件）
+# ═══════════════════════════════════════════════════════════
+# FormTransPDF — .gitignore
+# ═══════════════════════════════════════════════════════════
+
+# ── 应用运行输出（翻译生成的临时文件 / 译文 / 词汇表）──
 output/
 
-# Python
+# ── Python ──
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.so
+*$py.class
 *.egg-info/
-dist/
-build/
-build-nuitka/
+*.egg
+.eggs/
+.installed.cfg
+.python-version
 
-# 虚拟环境
+# ── 虚拟环境 / conda ──
+.conda/
 .venv/
 venv/
 env/
+ENV/
+env.bak/
+venv.bak/
 
-# IDE
+# ── 构建产物（PyInstaller / Nuitka）──
+build/
+build-nuitka/
+dist/
+nuitka-crash-report.xml
+nuitka-error.txt
+nuitka-out.txt
+
+# ── 测试 / 静态分析缓存 ──
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── 日志 / 临时文件 ──
+*.log
+*.tmp
+*.temp
+*.bak
+*~
+
+# ── IDE / 编辑器 ──
 .vscode/
 .idea/
+.vs/
+*.swp
+*.swo
+.project
+.settings/
+.classpath
+*.iml
+
+# ── GitHub ──
 .github/
 
-# 系统
+# ── 系统 ──
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# AI
+# ── AI 工具 ──
 reasonix.toml
 .reasonix/
 .codegraph/
 AGENTS.md
-
-# 打包
-nuitka-crash-report.xml
-nuitka-error.txt
-nuitka-out.txt
