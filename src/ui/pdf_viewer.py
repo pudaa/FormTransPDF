@@ -80,8 +80,9 @@ class PDFViewer(QWidget):
         self._pdf_view = QPdfView()
         self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
         self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
-        # 显式设置页面间距，确保与布局引擎一致
-        self._pdf_view.setPageSpacing(8)
+        # 页面间距设为 0：消除页与页之间的空隙（用户要求），同时天然保证
+        # 布局引擎与 QPdfView 的页间距完全一致（引擎动态读取 pageSpacing()）
+        self._pdf_view.setPageSpacing(0)
         self._pdf_view.setDocumentMargins(QMargins(0, 0, 0, 0))
         self._pdf_view.setViewportMargins(QMargins(0, 0, 0, 0))
         self._stack.addWidget(self._pdf_view)  # index 1
@@ -266,18 +267,15 @@ class PDFViewer(QWidget):
 
         QPdfView 的 zoomFactor 是「逻辑像素/点」(72 DPI)，实际渲染 = zoomFactor × DPI比率。
         因此 setZoomFactor 需要传入 视觉缩放比 / DPI比率。
+
+        视觉缩放比直接取自布局引擎的 Qt 精确计算（含 qRound 舍入），
+        保证从 FitToWidth 切换到 Custom 时不产生跳变。
         """
         if not self._fit_width:
             return self._scale
 
-        vp_w = max(self._pdf_view.viewport().width(), 1)
-        margins = self._pdf_view.documentMargins()
-        available_w = max(vp_w - margins.left() - margins.right(), 1)
-        if self._doc and self._doc.pageCount() > 0:
-            pt_w = max(self._doc.pagePointSize(0).width(), 1)
-            visual_scale = available_w / pt_w
-        else:
-            visual_scale = 1.0
+        vp = self._pdf_view.viewport()
+        visual_scale = self._layout_engine.current_scale(vp.width(), vp.height())
 
         self._scale = visual_scale
         self._fit_width = False
@@ -322,20 +320,16 @@ class PDFViewer(QWidget):
         self._pdf_view.pageModeChanged.connect(self._on_viewport_changed)
 
     def _current_scale(self) -> float:
-        """获取当前一致的渲染缩放比，供布局引擎使用。
+        """获取与 QPdfView 完全一致的当前渲染缩放比（物理像素/点）。
 
-        返回 self._scale 作为权威缩放比。在 FitToWidth 模式下，
-        QPdfView.zoomFactor() 恒为 1.0，因此不能直接使用。
-        改用 viewport 宽度推导实际显示缩放比。
+        由布局引擎按 Qt 的 calculateDocumentLayout() 精确计算：
+        - FitToWidth: res * (vp_w - 边距) / qRound(pt_w * res)
+        - Custom:     res * zoomFactor() == self._scale
         """
-        if self._fit_width and self._doc and self._doc.pageCount() > 0:
-            vp = self._pdf_view.viewport()
-            vp_w = max(vp.width(), 1)
-            margins = self._pdf_view.documentMargins()
-            available_w = max(vp_w - margins.left() - margins.right(), 1)
-            pt_w = max(self._doc.pagePointSize(0).width(), 1)
-            return available_w / pt_w
-        return self._scale
+        if not self._doc or self._doc.pageCount() == 0:
+            return self._scale
+        vp = self._pdf_view.viewport()
+        return self._layout_engine.current_scale(vp.width(), vp.height())
 
     def _on_viewport_changed(self):
         """滚动、缩放、resize 时调用，实时更新文本层坐标"""
@@ -343,10 +337,7 @@ class PDFViewer(QWidget):
             return
 
         vp = self._pdf_view.viewport()
-        scale = self._current_scale()
-        layouts = self._layout_engine.compute_layout(
-            vp.width(), vp.height(), explicit_scale=scale
-        )
+        layouts = self._layout_engine.compute_layout(vp.width(), vp.height())
 
         # ── 诊断：对比引擎计算的 content 尺寸与 QPdfView 实际 scrollbar ──
         self._diagnose_layout(layouts, vp)
