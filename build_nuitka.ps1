@@ -53,7 +53,7 @@ $NuitkaArgs = @(
     "--enable-plugin=pyside6"               # PySide6 Qt 插件支持
     "--enable-plugin=multiprocessing"       # multiprocessing 支持
     "--windows-icon-from-ico=$IconFile"     # 应用程序图标
-    "--include-data-dir=src/resources=src/resources"  # 资源文件
+    "--include-data-dir=src/resources=resources"  # 资源文件（数据根=resources，与 app.py/_get_data_path 一致）
     "--follow-import-to=src"                # 跟踪项目自身模块
     "--follow-import-to=pdf2zh_next"        # 翻译引擎
     "--follow-import-to=babeldoc"           # BabelDOC 引擎
@@ -90,8 +90,7 @@ $NuitkaArgs = @(
     "--nofollow-import-to=PySide6.QtQml"    # 不需要的 Qt 模块
     "--nofollow-import-to=PySide6.QtQuick"
     "--nofollow-import-to=PySide6.QtQuickWidgets"
-    "--nofollow-import-to=PySide6.QtSvg"
-    "--nofollow-import-to=PySide6.QtSvgWidgets"
+    # 注意：QtSvg 必须保留（icon_factory 用 QSvgRenderer 渲染 SVG 图标）
     "--nofollow-import-to=PySide6.QtCharts"
     "--nofollow-import-to=PySide6.QtDataVisualization"
     "--nofollow-import-to=PySide6.QtSensors"

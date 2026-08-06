@@ -17,6 +17,7 @@ hover 金色背景上“隐身”。
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QRectF, Qt
@@ -26,7 +27,27 @@ from PySide6.QtWidgets import QAbstractButton
 
 from src.ui.theme import theme_manager, _contrast_text
 
-ICON_DIR = Path(__file__).resolve().parent.parent / "resources" / "icons"
+
+def _data_root() -> Path:
+    """资源根目录：开发=项目 src/；PyInstaller=sys._MEIPASS；Nuitka=exe 同级。
+
+    与 src/app.py 的 _get_data_path() 保持同一套布局（<根>/resources/...），
+    避免打包后 __file__ 解析不一致导致资源找不到。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS)                # PyInstaller
+    if getattr(sys, "__compiled__", False):
+        return Path(sys.executable).parent       # Nuitka
+    try:
+        exe_dir = Path(sys.executable).parent
+        if "build-nuitka" in exe_dir.parts or "main.dist" in exe_dir.parts:
+            return exe_dir                        # Nuitka 兜底
+    except Exception:
+        pass
+    return Path(__file__).resolve().parent.parent  # 开发模式：项目 src/
+
+
+ICON_DIR = _data_root() / "resources" / "icons"
 
 # 模板色：icons/ 下 SVG 的原始填充色（加载时统一替换为目标颜色）
 _TEMPLATE_COLORS = ("#8b6914", "#d4a853")

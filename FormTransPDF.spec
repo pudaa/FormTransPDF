@@ -45,10 +45,8 @@ _HIDDEN_IMPORTS = [
 
 # ── 应用自身数据文件 ────────────────────────────────────
 _DATAS = [
-    (
-        str(_PROJECT_ROOT / "src" / "resources" / "icons" / "app.ico"),
-        "src/resources/icons",
-    ),
+    # 打包整个图标目录（SVG 为运行时图标资源，app.ico 为窗口图标）
+    (str(_PROJECT_ROOT / "src" / "resources" / "icons"), "resources/icons"),
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -110,8 +108,7 @@ a = Analysis(
         "PySide6.QtQml",
         "PySide6.QtQuick",
         "PySide6.QtQuickWidgets",
-        "PySide6.QtSvg",
-        "PySide6.QtSvgWidgets",
+        # 注意：QtSvg 必须保留（icon_factory 用 QSvgRenderer 渲染 SVG 图标）
         "PySide6.QtCharts",
         "PySide6.QtDataVisualization",
         "PySide6.QtSensors",
