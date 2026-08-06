@@ -19,7 +19,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QEasingCurve, QSettings, QVariantAnimation, Signal
+from PySide6.QtCore import QObject, Qt, QEasingCurve, QSettings, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -862,11 +862,14 @@ class MainWindow(QMainWindow):
                     self._update_minimap_viewport
                 )
                 self._minimap_synced = True
+            # 立即初始化视口指示器（布局未完成时内部自动重试）
+            self._update_minimap_viewport()
         except Exception:
             logger.debug("Failed to generate thumbnails", exc_info=True)
 
     def _position_minimap(self) -> None:
-        """将 minimap 定位到 viewer 右上角"""
+        """将 minimap 定位到 viewer 右上角（并随高度重算面板与滚动范围）"""
+        self._minimap.refresh_geometry()
         x = self._viewer.width() - self._minimap.width() - 8
         y = 8
         self._minimap.move(x, y)
@@ -878,15 +881,21 @@ class MainWindow(QMainWindow):
             self._position_minimap()
 
     def _update_minimap_viewport(self) -> None:
-        """根据当前滚动位置更新 minimap 的视口指示器"""
+        """根据当前滚动位置更新 minimap 的视口指示器。
+
+        比值统一以「内容总高 = scrollbar_max + pageStep」为分母，
+        保证指示器高度恒定（修复拖到最下方时指示器缩成一条线）。
+        """
         vbar = self._viewer.verticalScrollBar()
-        if vbar.maximum() <= 0:
+        page = vbar.pageStep()
+        total_h = vbar.maximum() + page
+        if total_h <= 0:
+            # 布局尚未完成：文档已加载则稍后重试
+            if self._viewer.page_count > 0:
+                QTimer.singleShot(100, self._update_minimap_viewport)
             return
-        ratio_start = vbar.value() / vbar.maximum()
-        viewport_h = self._viewer.viewport().height()
-        # QPdfView 内容总高度 = scrollbar_max + viewport_height
-        total_h = vbar.maximum() + viewport_h
-        ratio_end = min((vbar.value() + viewport_h) / max(total_h, 1), 1.0)
+        ratio_start = vbar.value() / total_h
+        ratio_end = min((vbar.value() + page) / total_h, 1.0)
         self._minimap.set_visible_range(ratio_start, ratio_end)
 
     def _on_minimap_page_clicked(self, page_number: int) -> None:
@@ -894,10 +903,14 @@ class MainWindow(QMainWindow):
         self._viewer.goto_page(page_number)
 
     def _on_minimap_dragged(self, ratio: float) -> None:
-        """拖拽 minimap 视口指示器 → 实时滚动 PDF"""
+        """拖拽 minimap 视口指示器 → 实时滚动 PDF（视口中心对齐拖拽点）"""
         vbar = self._viewer.verticalScrollBar()
-        if vbar and vbar.maximum() > 0:
-            vbar.setValue(int(ratio * vbar.maximum()))
+        page = vbar.pageStep()
+        total_h = vbar.maximum() + page
+        if total_h <= 0:
+            return
+        v = int(ratio * total_h - page / 2)
+        vbar.setValue(max(0, min(v, vbar.maximum())))
 
     # ═══════════════════════════════════════════════════════════
     # 拖拽

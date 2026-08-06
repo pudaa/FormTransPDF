@@ -9,7 +9,7 @@ Design: "Quiet Navigator" — 克制的琥珀/青铜指示器，柔光半透明�
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QRect, QEasingCurve, QPropertyAnimation, QSize, Signal
+from PySide6.QtCore import Qt, QRect, QEasingCurve, QPropertyAnimation, QSize, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QPainter,
@@ -42,6 +42,12 @@ class MinimapPanel(QWidget):
     THUMB_SCALE = 0.10
     PANEL_WIDTH = 100
     MIN_PAGE_HEIGHT = 6
+    PAD = 5             # 内容上/下留白
+    PAGE_GAP = 1        # 页间距
+    DRAG_THRESHOLD = 4  # 按下后移动超过该像素数即视为拖拽
+    EDGE_SCROLL_ZONE = 24      # 拖拽时光标贴近上下边缘则自动滚动
+    EDGE_SCROLL_INTERVAL = 30  # 边缘自动滚动周期 (ms)
+    EDGE_SCROLL_STEP = 16      # 每次推进的像素
 
     page_clicked = Signal(int)
     viewport_dragged = Signal(float)       # 垂直比例 (0~1)
@@ -50,12 +56,21 @@ class MinimapPanel(QWidget):
         super().__init__(parent)
         self._thumbnails: list[QPixmap] = []
         self._page_count: int = 0
+        self._page_pixmaps: list[QPixmap] = []   # 按面板宽度缩放后的每页图
+        self._page_offsets: list[int] = []       # 每页内容坐标 y（未减滚动偏移）
+        self._content_height: int = 0            # 内容总高（含底部留白）
+        self._scroll_offset: int = 0             # 内容垂直滚动偏移
+        self._max_scroll: int = 0                # 最大滚动偏移
         self._visible_range: tuple[float, float] = (0.0, 0.0)
         self._hovered_page: int = -1
+        self._pressed: bool = False
+        self._press_y: int = 0
+        self._drag_started: bool = False
         self._dragging: bool = False
-        self._drag_start_y: int = 0
-        self._drag_start_ratio: float = 0.0
-        self._total_content_h: int = 0
+        self._drag_y: int = 0
+        self._edge_timer = QTimer(self)
+        self._edge_timer.setInterval(self.EDGE_SCROLL_INTERVAL)
+        self._edge_timer.timeout.connect(self._on_edge_scroll_tick)
         self._opacity_base: int = 160       # 基础不透明度
         self._fade_anim: QPropertyAnimation | None = None
 
@@ -75,11 +90,53 @@ class MinimapPanel(QWidget):
     def load_document(self, page_count: int, thumbnails: list[QPixmap]) -> None:
         self._page_count = page_count
         self._thumbnails = thumbnails
-        self._update_height()
+        self._scroll_offset = 0
+        self._visible_range = (0.0, 0.0)
+        self.refresh_geometry()
         self.update()
+
+    def refresh_geometry(self) -> None:
+        """按面板宽度重算每页绘制尺寸/偏移与面板高度（槽位=绘制高度，无浪费）。"""
+        if not self._thumbnails:
+            return
+        thumb_w = self.width() - 14
+        pixmaps: list[QPixmap] = []
+        offsets: list[int] = []
+        cy = self.PAD
+        for thumb in self._thumbnails:
+            slot_h = max(thumb.height(), self.MIN_PAGE_HEIGHT)
+            scaled = thumb.scaled(
+                thumb_w, slot_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            pixmaps.append(scaled)
+            offsets.append(cy)
+            cy += scaled.height() + self.PAGE_GAP
+        self._page_pixmaps = pixmaps
+        self._page_offsets = offsets
+        self._content_height = cy
+        max_h = (self.parent().height() if self.parent() else 600) - 16
+        panel_h = min(self._content_height + self.PAD, max_h)
+        self.setFixedHeight(panel_h)
+        self._max_scroll = max(0, self._content_height + self.PAD - panel_h)
+        self._scroll_offset = min(self._scroll_offset, self._max_scroll)
 
     def set_visible_range(self, start_ratio: float, end_ratio: float) -> None:
         self._visible_range = (start_ratio, end_ratio)
+        self._ensure_indicator_visible()
+
+    def _ensure_indicator_visible(self) -> None:
+        """内容超高时自动滚动，使视口指示器保持完整可见（拖拽/滚轮滚动时跟随）。"""
+        if self._max_scroll <= 0 or self._content_height <= 0:
+            return
+        y1 = int(self._visible_range[0] * self._content_height)
+        y2 = int(self._visible_range[1] * self._content_height)
+        vis_bot = self._scroll_offset + self.height()
+        if y1 < self._scroll_offset:
+            self._scroll_offset = max(0, min(self._max_scroll, y1))
+        elif y2 > vis_bot:
+            self._scroll_offset = max(0, min(self._max_scroll, y2 - self.height()))
         self.update()
 
     def toggle(self) -> None:
@@ -129,56 +186,53 @@ class MinimapPanel(QWidget):
                            else QColor(120, 100, 70, 30),
         }
 
-    def _update_height(self) -> None:
-        if not self._thumbnails:
-            return
-        total_h = sum(max(p.height(), self.MIN_PAGE_HEIGHT) + 2
-                      for p in self._thumbnails)
-        max_h = (self.parent().height() if self.parent() else 600) - 16
-        self.setFixedHeight(min(total_h + 10, max_h))
-
     def _page_at_y(self, y: int) -> int:
-        if not self._thumbnails:
+        """屏幕 y → 页面索引（考虑滚动偏移）"""
+        if not self._page_offsets:
             return -1
-        cy = 5
-        for i, thumb in enumerate(self._thumbnails):
-            h = max(thumb.height(), self.MIN_PAGE_HEIGHT)
-            if cy <= y < cy + h + 2:
+        content_y = y + self._scroll_offset
+        for i, (off, pix) in enumerate(zip(self._page_offsets, self._page_pixmaps)):
+            if off <= content_y < off + pix.height() + self.PAGE_GAP:
                 return i
-            cy += h + 2
         return -1
 
     def _viewport_rect(self, colors: dict) -> QRect | None:
-        """计算视口指示器的矩形区域"""
-        if self._total_content_h <= 0 or self._visible_range[1] <= 0:
+        """计算视口指示器的矩形区域（考虑滚动，越界时在边缘露一线）"""
+        if self._content_height <= 0 or self._visible_range[1] <= 0:
             return None
         w = self.width()
-        y1 = int(self._visible_range[0] * self._total_content_h) + 5
-        y2 = int(self._visible_range[1] * self._total_content_h) + 5
-        return QRect(2, y1, w - 4, max(y2 - y1, 4))
+        h_panel = self.height()
+        y1 = int(self._visible_range[0] * self._content_height) - self._scroll_offset
+        y2 = int(self._visible_range[1] * self._content_height) - self._scroll_offset
+        if y2 <= 0:            # 完全在当前可视区上方
+            return QRect(2, 0, w - 4, 4)
+        if y1 >= h_panel:      # 完全在下方
+            return QRect(2, h_panel - 4, w - 4, 4)
+        y1 = max(0, y1)
+        y2 = min(h_panel, y2)
+        h = max(y2 - y1, 4)
+        if h >= h_panel:
+            return QRect(2, 0, w - 4, h_panel)
+        return QRect(2, y1, w - 4, h)
 
     def _scroll_ratio_from_y(self, y: int) -> float:
-        """根据鼠标 Y 坐标计算对应的滚动比例"""
-        if self._total_content_h <= 0:
+        """屏幕 y → 滚动比例（考虑滚动偏移；0~1，视口中心对齐光标）"""
+        if self._content_height <= 0:
             return 0.0
-        indicator_h = max(
-            (self._visible_range[1] - self._visible_range[0]) * self._total_content_h,
-            4,
-        )
-        ratio = (y - 5 - indicator_h / 2) / self._total_content_h
+        ratio = (y + self._scroll_offset) / self._content_height
         return max(0.0, min(1.0, ratio))
 
     # ── 事件 ────────────────────────────────────────────────
 
     def paintEvent(self, event: QPaintEvent | None) -> None:
-        if not self._thumbnails:
+        if not self._page_pixmaps:
             return
 
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setClipRect(self.rect())   # 滚动时内容不溢出
         c = self._panel_colors()
         w = self.width()
-        thumb_w = w - 14
 
         # 柔光背景 + 圆角
         p.setPen(Qt.PenStyle.NoPen)
@@ -191,28 +245,20 @@ class MinimapPanel(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
 
-        # 缩略图
-        cy = 5
-        for i, thumb in enumerate(self._thumbnails):
-            h = max(thumb.height(), self.MIN_PAGE_HEIGHT)
-            scaled = thumb.scaled(
-                thumb_w, h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            px = (w - scaled.width()) // 2
+        # 缩略图（仅绘制可见区域）
+        for i, pix in enumerate(self._page_pixmaps):
+            off = self._page_offsets[i] - self._scroll_offset
+            if off + pix.height() < 0 or off > self.height():
+                continue
+            px = (w - pix.width()) // 2
 
             # 页阴影（微妙的深度暗示）
-            p.fillRect(px + 1, cy + 1, scaled.width(), h, c["page_shadow"])
-            p.drawPixmap(px, cy, scaled)
+            p.fillRect(px + 1, off + 1, pix.width(), pix.height(), c["page_shadow"])
+            p.drawPixmap(px, off, pix)
 
             # 悬停发光
             if i == self._hovered_page:
-                p.fillRect(px, cy, scaled.width(), h, c["hover"])
-
-            cy += h + 2
-
-        self._total_content_h = cy - 2
+                p.fillRect(px, off, pix.width(), pix.height(), c["hover"])
 
         # 视口指示器
         vp_rect = self._viewport_rect(c)
@@ -230,23 +276,12 @@ class MinimapPanel(QWidget):
         p.end()
 
     def mousePressEvent(self, event: QMouseEvent | None) -> None:
-        if event is None:
+        if event is None or event.button() != Qt.MouseButton.LeftButton:
             return
-        y = int(event.position().y())
-        vp_rect = self._viewport_rect(self._panel_colors())
-
-        if event.button() == Qt.MouseButton.LeftButton:
-            if vp_rect and vp_rect.contains(event.pos()):
-                # 拖拽视口指示器
-                self._dragging = True
-                self._drag_start_y = y
-                self._drag_start_ratio = self._scroll_ratio_from_y(y)
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            else:
-                # 点击跳转页面
-                page = self._page_at_y(y)
-                if 0 <= page < self._page_count:
-                    self.page_clicked.emit(page)
+        self._pressed = True
+        self._press_y = int(event.position().y())
+        self._drag_started = False
+        self._dragging = False
 
     def mouseMoveEvent(self, event: QMouseEvent | None) -> None:
         if event is None:
@@ -254,20 +289,80 @@ class MinimapPanel(QWidget):
         y = int(event.position().y())
 
         if self._dragging:
-            ratio = self._scroll_ratio_from_y(y)
-            self.viewport_dragged.emit(ratio)
-        else:
-            page = self._page_at_y(y)
-            if page != self._hovered_page:
-                self._hovered_page = page
-                self.update()
+            # 拖拽中：连续滚动（视口中心跟随光标）
+            self._drag_y = y
+            self.viewport_dragged.emit(self._scroll_ratio_from_y(y))
+            self._update_edge_timer(y)
+            return
+
+        if self._pressed and not self._drag_started and abs(y - self._press_y) >= self.DRAG_THRESHOLD:
+            # 按下后移动超过阈值 → 进入拖拽模式（无需先点击，按下即拖）
+            self._drag_started = True
+            self._dragging = True
+            self._drag_y = y
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.viewport_dragged.emit(self._scroll_ratio_from_y(y))
+            self._update_edge_timer(y)
+            return
+
+        page = self._page_at_y(y)
+        if page != self._hovered_page:
+            self._hovered_page = page
+            self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent | None) -> None:
-        if event is None:
+        if event is None or event.button() != Qt.MouseButton.LeftButton:
             return
-        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
+        self._pressed = False
+        self._edge_timer.stop()
+        if self._dragging:
             self._dragging = False
+            self._drag_started = False
             self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.update()
+            return
+        # 未拖拽 → 视为点击：精确跳转到该页
+        page = self._page_at_y(self._press_y)
+        if 0 <= page < self._page_count:
+            self.page_clicked.emit(page)
+
+    def _update_edge_timer(self, y: int) -> None:
+        """拖拽时光标贴近面板上下边缘 → 启动定时自动滚动（可到达所有页）。"""
+        h = self.height()
+        if self._max_scroll <= 0:
+            self._edge_timer.stop()
+            return
+        if y >= h - self.EDGE_SCROLL_ZONE and self._scroll_offset < self._max_scroll:
+            self._edge_timer.start()
+        elif y <= self.EDGE_SCROLL_ZONE and self._scroll_offset > 0:
+            self._edge_timer.start()
+        else:
+            self._edge_timer.stop()
+
+    def _on_edge_scroll_tick(self) -> None:
+        """边缘自动滚动：光标保持在边缘时持续推进内容与滚动比例。"""
+        if not self._dragging:
+            self._edge_timer.stop()
+            return
+        y = self._drag_y
+        h = self.height()
+        if y >= h - self.EDGE_SCROLL_ZONE:
+            if self._scroll_offset >= self._max_scroll:
+                self._edge_timer.stop()
+                return
+            self._scroll_offset = min(
+                self._max_scroll, self._scroll_offset + self.EDGE_SCROLL_STEP
+            )
+        elif y <= self.EDGE_SCROLL_ZONE:
+            if self._scroll_offset <= 0:
+                self._edge_timer.stop()
+                return
+            self._scroll_offset = max(0, self._scroll_offset - self.EDGE_SCROLL_STEP)
+        else:
+            self._edge_timer.stop()
+            return
+        self.update()
+        self.viewport_dragged.emit(self._scroll_ratio_from_y(y))
 
     def enterEvent(self, event: QEnterEvent | None) -> None:
         self._opacity_base = 210
@@ -281,8 +376,20 @@ class MinimapPanel(QWidget):
         self.update()
 
     def wheelEvent(self, event) -> None:
-        # 滚轮事件透传给父组件（PDF 查看器）
-        event.ignore()
+        # 滚轮滚动缩略图内容（内容超高时可到达所有页面）
+        if self._max_scroll <= 0:
+            event.ignore()
+            return
+        delta = event.angleDelta().y()
+        if delta:
+            step = max(24, abs(delta) // 4)
+            self._scroll_offset = max(
+                0, min(self._max_scroll, self._scroll_offset - (step if delta > 0 else -step))
+            )
+            self.update()
+            event.accept()
+        else:
+            event.ignore()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -290,7 +397,7 @@ class MinimapPanel(QWidget):
 # ═══════════════════════════════════════════════════════════
 
 def generate_thumbnails(doc: QPdfDocument, page_count: int, thumb_scale: float = 0.10) -> list[QPixmap]:
-    """从 QPdfDocument 生成全部页面的缩略图 — 白色底板"""
+    """从 QPdfDocument 生成全部页面的缩略图 — 白色底板（无额外边框，槽位不浪费）"""
     from PySide6.QtGui import QPainter
     thumbnails: list[QPixmap] = []
     white = QColor("#ffffff")
@@ -301,11 +408,11 @@ def generate_thumbnails(doc: QPdfDocument, page_count: int, thumb_scale: float =
         image = doc.render(i, QSize(thumb_w, thumb_h))
         if image.isNull():
             continue
-        # 合成到白色底板上
-        canvas = QImage(thumb_w + 4, thumb_h + 4, QImage.Format.Format_ARGB32)
+        # 合成到与渲染图同尺寸的白色底板上（无边框，避免纵向空间浪费）
+        canvas = QImage(image.size(), QImage.Format.Format_ARGB32)
         canvas.fill(white)
         p = QPainter(canvas)
-        p.drawImage(2, 2, image)
+        p.drawImage(0, 0, image)
         p.end()
         thumbnails.append(QPixmap.fromImage(canvas))
     return thumbnails
