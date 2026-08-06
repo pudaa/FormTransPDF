@@ -24,7 +24,7 @@ from PySide6.QtGui import (
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
-from src.ui.theme import theme_manager, ThemePalette, ThemeMode
+from src.ui.base.theme import theme_manager, ThemePalette, ThemeMode
 
 
 # ═══════════════════════════════════════════════════════════

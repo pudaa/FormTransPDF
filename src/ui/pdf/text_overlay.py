@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QPoint, QRectF, QTimer, QPropertyAnimation
 from PySide6.QtGui import QPainter, QColor
 
-from src.ui.icon_factory import svg_icon
-from src.ui.theme import theme_manager
+from src.ui.base.icon_factory import svg_icon
+from src.ui.base.theme import theme_manager
 
 
 class TextOverlay(QWidget):

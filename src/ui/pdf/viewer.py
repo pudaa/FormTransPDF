@@ -14,11 +14,9 @@ PDF 页面渲染与查看组件 — 基于 QPdfView (PySide6 QtPdf)
 
 from __future__ import annotations
 
-import urllib.parse
-
-from PySide6.QtCore import Qt, QPoint, QEvent, QMargins, QRectF, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QPoint, QEvent, QMargins, QRectF, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QMouseEvent, QPalette, QWheelEvent, QScreen,
+    QColor, QMouseEvent, QPalette, QWheelEvent, QScreen,
 )
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -30,14 +28,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ui.theme import Colors, theme_manager
-from src.ui.pdf_layout_engine import PdfLayoutEngine, PageLayout
-from src.ui.pdf_text_extractor import PdfTextExtractor, TextSpan
-from src.ui.pdf_text_overlay import TextOverlay
+from src.ui.base.theme import Colors, theme_manager
+from src.ui.pdf.layout_engine import PdfLayoutEngine, PageLayout
+from src.ui.pdf.text_extractor import PdfTextExtractor, TextSpan
+from src.ui.pdf.text_overlay import TextOverlay
+from src.ui.pdf.selection import TextSelectionMixin
 
 
-class PDFViewer(QWidget):
-    """PDF 查看器 — QPdfView + 双层渲染文本选中。
+class PDFViewerCore(QWidget):
+    """PDF 查看器核心 — QPdfView + 文档生命周期 + 缩放 + 视口跟踪。
 
     StackedLayout:
         [0] placeholder — 无 PDF 时展示
@@ -47,7 +46,8 @@ class PDFViewer(QWidget):
     架构：
         - PdfLayoutEngine: 计算每页在内容坐标系中的 QRect
         - PdfTextExtractor: 后台线程提取文本，带 doc_id 版本控制
-        - eventFilter: 统一处理中键拖拽、Ctrl+滚轮、左键文本选择
+        - 文本选择 / 平移交互：TextSelectionMixin（selection.py），
+          由最终类 PDFViewer 组合
     """
 
     # ========== 信号 ==========
@@ -133,20 +133,6 @@ class PDFViewer(QWidget):
 
         self._apply_bg_style()
         self._stack.setCurrentIndex(0)  # 初始显示 placeholder
-
-    # ── 坐标转换工具 ───────────────────────────────────────
-
-    def _viewport_rect_to_content(self, vp_rect: QRectF) -> QRectF:
-        """将 viewport 坐标矩形转换为内容坐标矩形"""
-        sx = self.horizontalScrollBar().value()
-        sy = self.verticalScrollBar().value()
-        return vp_rect.translated(sx, sy)
-
-    def _content_rect_to_viewport(self, content_rect: QRectF) -> QRectF:
-        """将内容坐标矩形转换为 viewport 坐标矩形"""
-        sx = self.horizontalScrollBar().value()
-        sy = self.verticalScrollBar().value()
-        return content_rect.translated(-sx, -sy)
 
     # ── 样式 ────────────────────────────────────────────────
 
@@ -407,10 +393,6 @@ class PDFViewer(QWidget):
         self._text_overlay.setGeometry(0, 0, vp.width(), vp.height())
         self._text_overlay.raise_()
 
-    # ── 坐标转换工具（已替换为 QGraphicsView 映射）──────────
-
-    # _viewport_rect_to_content 和 _content_rect_to_viewport 已移到上面
-
     # ── 异步提取回调 ───────────────────────────────────────
 
     def _on_text_page_ready(self, page_num: int, spans: list, doc_id: int):
@@ -427,86 +409,23 @@ class PDFViewer(QWidget):
         if doc_id == self._doc_id:
             print(f"PDF 文本提取完成，共 {len(self._text_spans)} 页")
 
-    # ── 文本选中逻辑 ───────────────────────────────────────
-
-    def _update_highlights_for_selection(self, content_rect: QRectF):
-        """根据内容坐标系的选择矩形，计算并设置 viewport 高亮"""
-        highlights = []
-        for spans in self._text_spans.values():
-            for span in spans:
-                if span.content_rect and content_rect.intersects(span.content_rect):
-                    vp_rect = self._content_rect_to_viewport(span.content_rect)
-                    highlights.append(vp_rect)
-        self._text_overlay.set_highlights(highlights)
-
-    def _refresh_highlights(self):
-        """根据存储的内容选区刷新 viewport 高亮（用于滚动/缩放时同步）"""
-        if self._selected_content_rect is None:
-            return
-        self._update_highlights_for_selection(self._selected_content_rect)
-
-    def _get_text_in_rect(self, content_rect: QRectF) -> str:
-        """获取选择矩形内的文本（按页面顺序拼接）"""
-        texts = []
-        # 按页码排序，保证阅读顺序
-        for page_num in sorted(self._text_spans.keys()):
-            spans = self._text_spans[page_num]
-            for span in spans:
-                if span.content_rect and content_rect.intersects(span.content_rect):
-                    texts.append(span.text)
-        return "".join(texts)
-
-    # ── 工具栏动作 ─────────────────────────────────────────
-
-    def _copy_selected_text(self):
-        """复制选中文本到剪贴板（带「已复制」按钮态 + 弹窗气泡提示）"""
-        if not self._selected_text:
-            return
-        QApplication.clipboard().setText(self._selected_text)
-        self._text_overlay.toolbar.show_copied()
-        # 弹窗提示「已复制」（定位在选区下方）
-        rects = self._text_overlay._highlights
-        anchor = None
-        if rects:
-            united = rects[0]
-            for r in rects[1:]:
-                united = united.united(r)
-            anchor = united
-        self._text_overlay.show_toast("已复制", anchor)
-
-    def _on_toolbar_translate(self):
-        """浮动工具栏「翻译」：把选中文本交给主窗口的即时翻译。"""
-        if self._selected_text:
-            self.translate_requested.emit(self._selected_text)
-
-    def _on_toolbar_search(self):
-        """浮动工具栏「搜索」：在浏览器中用 Google Scholar 检索选中文本。"""
-        if not self._selected_text:
-            return
-        query = urllib.parse.quote(self._selected_text.strip())
-        QDesktopServices.openUrl(QUrl(f"https://scholar.google.com/scholar?q={query}"))
-
-    def _search_selected_text(self):
-        """搜索选中文本"""
-        if self._selected_text:
-            print(f"搜索: {self._selected_text[:50]}")
-
-    def _clear_selection(self):
-        """清除当前选择"""
-        self._selected_text = ""
-        self._selected_content_rect = None
-        self._text_overlay.clear_highlights()
-
-    def _add_permanent_highlight(self):
-        """添加永久高亮"""
-        print(f"标记高亮: {self._selected_text[:50]}")
-
     # ── resizeEvent ─────────────────────────────────────────
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._sync_overlay_geometry()
         self._on_viewport_changed()
+
+
+class PDFViewer(TextSelectionMixin, PDFViewerCore):
+    """最终 PDF 查看器 — 组合文档核心与文本选择交互。
+
+    事件过滤器统一分发：
+    - 视口 resize → 覆盖层同步
+    - Ctrl+滚轮 → 缩放
+    - 左键按下/拖动/释放 → TextSelectionMixin 划词选择
+    - 中键按下/拖动/释放 → TextSelectionMixin 平移
+    """
 
     # ── 事件过滤器（中键拖拽 + Ctrl+滚轮缩放 + 左键文本选择）──
 
@@ -545,81 +464,26 @@ class PDFViewer(QWidget):
         if event.type() == QEvent.Type.MouseButtonPress:
             me = event
             if me.button() == Qt.MouseButton.LeftButton:
-                self._selecting = True
-                self._drag_threshold_met = False
-                self._select_start = me.pos()
-                self._selected_text = ""
-                self._selected_content_rect = None
-                self._text_overlay.clear_highlights()
+                self._on_select_press(me)
                 return False  # 不消耗事件：让 QPdfView 正常处理单击，滚动由拖拽触发
             # 中键拖拽
             elif me.button() == Qt.MouseButton.MiddleButton:
-                self._panning = True
-                self._pan_start = me.globalPosition().toPoint()
-                h = self.horizontalScrollBar()
-                v = self.verticalScrollBar()
-                self._pan_scroll_start = QPoint(
-                    h.value() if h else 0, v.value() if v else 0)
-                self._pdf_view.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                self._on_pan_begin(me)
                 return True
 
         elif event.type() == QEvent.Type.MouseMove:
             if self._selecting:
-                me = event
-                delta = me.pos() - self._select_start
-                # 拖拽超过 5px 阈值才进入选择模式
-                if not self._drag_threshold_met:
-                    if abs(delta.x()) < 5 and abs(delta.y()) < 5:
-                        return False  # 未达阈值，事件继续传递给 QPdfView
-                    self._drag_threshold_met = True
-                # 实时高亮（不绘制拖动选择框）
-                rect = QRectF(self._select_start, me.pos()).normalized()
-                content_rect = self._viewport_rect_to_content(rect)
-                self._update_highlights_for_selection(content_rect)
-                return True
+                return self._on_select_move(event)
             if self._panning and self._pan_start and self._pan_scroll_start:
-                me = event
-                delta = me.globalPosition().toPoint() - self._pan_start
-                h = self.horizontalScrollBar()
-                v = self.verticalScrollBar()
-                if h:
-                    h.setValue(self._pan_scroll_start.x() - delta.x())
-                if v:
-                    v.setValue(self._pan_scroll_start.y() - delta.y())
-                return True
+                return self._on_pan_move(event)
 
         elif event.type() == QEvent.Type.MouseButtonRelease:
             me = event
             if self._selecting and me.button() == Qt.MouseButton.LeftButton:
                 self._selecting = False
-
-                if not self._drag_threshold_met:
-                    # 纯点击（无拖拽），清空状态，事件传递回 QPdfView
-                    self._text_overlay.clear_highlights()
-                    return False
-
-                rect = QRectF(self._select_start, me.pos()).normalized()
-                content_rect = self._viewport_rect_to_content(rect)
-
-                # 计算最终选中文本
-                text = self._get_text_in_rect(content_rect)
-                if text:
-                    self._selected_text = text
-                    self._selected_content_rect = content_rect
-                    self.text_selected.emit(text)
-                    QApplication.clipboard().setText(text)
-                    # 选中完成后显示浮动工具栏
-                    self._text_overlay.show_toolbar_at(self._text_overlay._highlights)
-                else:
-                    self._selected_content_rect = None
-                    self._text_overlay.clear_highlights()
-
-                return True
+                return self._on_select_release(me)
             elif me.button() == Qt.MouseButton.MiddleButton:
-                self._panning = False
-                self._pan_start = None
-                self._pan_scroll_start = None
-                self._pdf_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+                self._on_pan_end(me)
                 return True
 
         return super().eventFilter(obj, event)

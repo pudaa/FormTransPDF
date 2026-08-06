@@ -23,14 +23,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.text_translator import (
+from src.core.translation.text import (
     TextTranslationError,
     TextTranslationProfile,
     normalize_translation_profile,
     translate_text,
 )
-from src.ui.icon_factory import svg_icon
-from src.ui.theme import ThemePalette, theme_manager, _contrast_text
+from src.ui.base.icon_factory import svg_icon
+from src.ui.base.theme import ThemePalette, theme_manager, _contrast_text
 
 LANGUAGE_OPTIONS = [
     ("en", "English"),

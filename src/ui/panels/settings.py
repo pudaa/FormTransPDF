@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.signals import TranslationTask
-from src.ui.icon_factory import accent_icon, svg_icon
-from src.ui.theme import Colors, DIVIDER_STYLE, _contrast_text, theme_manager
+from src.ui.base.icon_factory import accent_icon, svg_icon
+from src.ui.base.theme import Colors, DIVIDER_STYLE, _contrast_text, theme_manager
 
 # ═══════════════════════════════════════════════════════════════
 # 翻译服务元数据 + 常用模型列表

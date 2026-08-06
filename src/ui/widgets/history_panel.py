@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ui.icon_factory import accent_icon
-from src.ui.theme import Colors
+from src.ui.base.icon_factory import accent_icon
+from src.ui.base.theme import Colors
 
 
 # ═══════════════════════════════════════════════════════════════

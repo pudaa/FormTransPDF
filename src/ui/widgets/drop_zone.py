@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPainter, QPen, QColor
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from src.ui.theme import Colors
+from src.ui.base.theme import Colors
 
 
 class DropZone(QWidget):

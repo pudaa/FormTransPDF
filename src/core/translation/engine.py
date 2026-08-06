@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import AsyncIterator
 
-from .signals import TranslationEvent, TranslationTask, TranslationSignals
+from ..signals import TranslationEvent, TranslationTask, TranslationSignals
 
 logger = logging.getLogger(__name__)
 

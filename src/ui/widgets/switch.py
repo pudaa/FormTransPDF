@@ -11,7 +11,7 @@ from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, Qt, Signa
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QWidget
 
-from src.ui.theme import theme_manager
+from src.ui.base.theme import theme_manager
 
 
 class Switch(QWidget):

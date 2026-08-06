@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QApplication
 import qasync
 
 from src import __app_name__, __version__
-from src.ui.theme import (
+from src.ui.base.theme import (
     ThemeManager,
     ThemeMode,
     _ColorsProxy,
@@ -119,12 +119,12 @@ class FormTransPDFApp(QApplication):
 
     def run(self) -> int:
         # ── 启动画面（在慢速 babeldoc 导入前展示）──
-        from src.ui.splash import StartupSplash
+        from src.ui.windows.splash import StartupSplash
         splash = StartupSplash()
         splash.show()
         self.processEvents()  # 强制绘制启动画面
 
-        from src.ui.main_window import MainWindow
+        from src.ui.windows.main_window import MainWindow
 
         loop = qasync.QEventLoop(self)
         asyncio.set_event_loop(loop)

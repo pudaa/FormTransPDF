@@ -12,14 +12,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import shutil
 import sys
-import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QEasingCurve, QSettings, QTimer, QVariantAnimation, Signal
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,16 +33,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.signals import TranslationEvent, TranslationTask, TranslationSignals
-from src.core.translator import EngineNotReadyError, TranslationEngine
-from src.ui.quick_translate_dialog import QuickTranslateDialog
-from src.ui.pdf_viewer import PDFViewer
-from src.ui.settings_panel import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
-from src.ui.icon_factory import IconHoverFilter, accent_icon
-from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
+from src.core.signals import TranslationSignals
+from src.core.translation.engine import TranslationEngine
+from src.ui.base.icon_factory import IconHoverFilter, accent_icon
+from src.ui.base.theme import ThemePalette, theme_manager, _contrast_text
+from src.ui.panels.settings import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
+from src.ui.pdf.viewer import PDFViewer
+from src.ui.windows.history_flow import _HistoryFlowMixin
+from src.ui.windows.minimap_controller import _MinimapControllerMixin
+from src.ui.windows.sidebar_behavior import _SidebarBehaviorMixin
+from src.ui.windows.translation_flow import _EngineLoader, _TranslationFlowMixin
 from src.ui.widgets.drop_zone import DropZone
 from src.ui.widgets.history_panel import HistoryPanel
-from src.ui.widgets.minimap import MinimapPanel, generate_thumbnails
+from src.ui.widgets.minimap import MinimapPanel
 from src.ui.widgets.switch import Switch
 
 logger = logging.getLogger(__name__)
@@ -87,7 +87,8 @@ def _get_output_dir() -> Path:
     if _is_frozen():
         base = Path.home() / "FormTransPDF" / "output"
     else:
-        base = Path(__file__).resolve().parent.parent.parent / "output"
+        # src/ui/windows/main_window.py → 上四级即项目根目录
+        base = Path(__file__).resolve().parents[3] / "output"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -96,35 +97,21 @@ def _get_output_dir() -> Path:
 # 主窗口
 # ═══════════════════════════════════════════════════════════════
 
-class _EngineLoader(QObject):
-    """在后台线程中加载翻译引擎，完成后通过信号通知主线程。"""
+class MainWindow(
+    _TranslationFlowMixin,
+    _HistoryFlowMixin,
+    _MinimapControllerMixin,
+    _SidebarBehaviorMixin,
+    QMainWindow,
+):
+    """FormTransPDF 主窗口
 
-    loaded = Signal()
-    failed = Signal(str)
-
-    def __init__(self, engine: TranslationEngine) -> None:
-        super().__init__()
-        self._engine = engine
-
-    def run(self) -> None:
-        try:
-            self._engine.load()
-        except Exception as exc:
-            logger.exception("Translation engine load failed")
-            self._safe_emit(self.failed, str(exc))
-        else:
-            self._safe_emit(self.loaded)
-
-    def _safe_emit(self, signal, *args) -> None:
-        """主窗口可能已销毁（用户提前关闭应用），此时静默忽略信号。"""
-        try:
-            signal.emit(*args)
-        except RuntimeError:
-            pass
-
-
-class MainWindow(QMainWindow):
-    """FormTransPDF 主窗口"""
+    将各功能域 mixin 组合为完整主窗口：
+    - _SidebarBehaviorMixin   侧边栏动画 / 缩放标签
+    - _TranslationFlowMixin   翻译编排 / 即时翻译弹窗
+    - _HistoryFlowMixin       历史记录回放
+    - _MinimapControllerMixin 缩略图导航
+    """
 
     SIDEBAR_WIDTH = 280
     MIN_WINDOW_W = 900
@@ -513,76 +500,6 @@ class MainWindow(QMainWindow):
             self._history.refresh_theme()
 
     # ═══════════════════════════════════════════════════════════
-    # 侧边栏 / 缩放
-    # ═══════════════════════════════════════════════════════════
-
-    def _toggle_sidebar(self) -> None:
-        self._sidebar_visible = not self._sidebar_visible
-        target_w = self.SIDEBAR_WIDTH if self._sidebar_visible else 0
-        start_w = self._sidebar.width()
-
-        # 确保展开前 widget 可见
-        if self._sidebar_visible:
-            self._sidebar.setVisible(True)
-            self._sidebar_sep.setVisible(True)
-
-        # 如果已在目标宽度，跳过
-        if start_w == target_w:
-            if not self._sidebar_visible:
-                self._on_sidebar_collapsed()
-            return
-
-        # ── 使用 QVariantAnimation 驱动 setFixedWidth，
-        #    直接强制宽度，不受布局缓存 / 子控件 min-size 干扰 ──
-        self._sidebar_anim = QVariantAnimation()
-        self._sidebar_anim.setDuration(260)
-        self._sidebar_anim.setStartValue(start_w)
-        self._sidebar_anim.setEndValue(target_w)
-        self._sidebar_anim.setEasingCurve(
-            QEasingCurve.Type.OutCubic if self._sidebar_visible
-            else QEasingCurve.Type.InCubic
-        )
-
-        def _drive(value: float) -> None:
-            w = int(value)
-            self._sidebar.setFixedWidth(w)
-            self._sidebar_sep.setFixedWidth(2 if w > 10 else 0)
-
-        self._sidebar_anim.valueChanged.connect(_drive)
-
-        if not self._sidebar_visible:
-            self._sidebar_anim.finished.connect(self._on_sidebar_collapsed)
-        else:
-            self._sidebar_anim.finished.connect(self._on_sidebar_expanded)
-
-        self._sidebar_anim.finished.connect(self._on_sidebar_anim_finished)
-        self._sidebar_anim.start()
-
-    def _on_sidebar_collapsed(self) -> None:
-        """收起动画结束后隐藏侧边栏和分隔线"""
-        self._sidebar.setVisible(False)
-        self._sidebar_sep.setVisible(False)
-
-    def _on_sidebar_expanded(self) -> None:
-        """展开动画结束后恢复约束（为下次收起动画做准备）"""
-        # 从 setFixedWidth 的锁死状态恢复为可动画的 min/max 模式
-        self._sidebar.setMinimumWidth(0)
-        self._sidebar.setMaximumWidth(self.SIDEBAR_WIDTH)
-        self._sidebar_sep.setMinimumWidth(0)
-        self._sidebar_sep.setMaximumWidth(2)
-
-    def _on_sidebar_anim_finished(self) -> None:
-        """动画结束后重定位 minimap（布局已稳定）"""
-        if self._minimap and self._minimap.isVisible():
-            self._position_minimap()
-
-    def _update_zoom_label(self) -> None:
-        if self._viewer.is_fit_width:
-            self._zoom_label.setText("适应")
-        else:
-            self._zoom_label.setText(f"{int(self._viewer.scale * 100)}%")
-
-    # ═══════════════════════════════════════════════════════════
     # 信号
     # ═══════════════════════════════════════════════════════════
 
@@ -652,277 +569,6 @@ class MainWindow(QMainWindow):
         self._update_zoom_label()
 
     # ═══════════════════════════════════════════════════════════
-    # 翻译
-    # ═══════════════════════════════════════════════════════════
-
-    def _on_translate(self) -> None:
-        if not self._current_pdf:
-            QMessageBox.information(self, "提示", "请先选择 PDF 文件")
-            return
-
-        # 先持久化设置：即使引擎未就绪/加载失败，用户的选择也必须保存
-        self._settings.save_settings()
-
-        if not self._engine.is_ready:
-            if self._engine.load_error:
-                self._settings.set_status(
-                    f"翻译引擎不可用：{self._engine.load_error}", is_error=True
-                )
-                return
-            # 引擎仍在后台加载：挂起请求，就绪后自动开始
-            self._pending_translate = True
-            self._settings.set_status("翻译引擎加载中，就绪后自动开始…")
-            return
-
-        task = self._settings.build_task(str(self._current_pdf))
-
-        if task.api_key == "" and task.translator not in ("ollama", "xinference", "qwenmt"):
-            reply = QMessageBox.question(
-                self, "缺少 API Key",
-                f"翻译服务「{task.translator}」需要 API Key。\n\n"
-                "是否继续？（可能使用环境变量中的 Key）",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
-        self._settings.set_translating(True)
-        self._progress.setVisible(True)
-        self._progress.setValue(0)
-        asyncio.ensure_future(self._run_translate(task))
-
-    def _start_engine_load(self) -> None:
-        """后台线程加载翻译引擎（重型 pdf2zh_next/babeldoc 导入），不阻塞启动。"""
-        worker = _EngineLoader(self._engine)
-        worker.loaded.connect(self._on_engine_loaded)
-        worker.failed.connect(self._on_engine_load_failed)
-        self._engine_worker = worker
-        self._engine_thread = threading.Thread(
-            target=worker.run, name="engine-loader", daemon=True
-        )
-        self._settings.set_status("正在后台加载翻译引擎…")
-        self._engine_thread.start()
-
-    def _on_engine_loaded(self) -> None:
-        """翻译引擎加载完成：更新状态，若有挂起请求则自动开始翻译。"""
-        logger.info("Translation engine ready")
-        self._settings.set_status("翻译引擎就绪 — 可以开始翻译")
-        if self._pending_translate:
-            self._pending_translate = False
-            self._on_translate()
-
-    def _on_engine_load_failed(self, message: str) -> None:
-        """翻译引擎加载失败：提示用户，翻译功能不可用。"""
-        logger.error("Translation engine failed to load: %s", message)
-        self._settings.set_status(f"翻译引擎加载失败：{message}", is_error=True)
-
-    async def _run_translate(self, task: TranslationTask) -> None:
-        try:
-            async for event in self._engine.run(task, self._signals, output_dir=self._output_dir):
-                pass
-        except EngineNotReadyError as exc:
-            self._settings.set_status(str(exc), is_error=True)
-        except Exception as exc:
-            logger.exception("Translation failed")
-            QMessageBox.critical(self, "翻译异常", str(exc))
-        finally:
-            self._settings.set_translating(False)
-            self._progress.setVisible(False)
-
-    def _on_progress(self, event: TranslationEvent) -> None:
-        self._progress.setMaximum(event.total)
-        self._progress.setValue(event.current)
-        self._settings.set_status(event.message)
-
-    def _on_auto_translate_toggled(self, checked: bool) -> None:
-        """划词自动弹出即时翻译开关（持久化保存 + 更新提示）"""
-        self._auto_popup_quick = checked
-        self._app_settings.setValue("quick_translate_auto_popup", checked)
-        self._app_settings.sync()
-        self._auto_translate_switch.setToolTip(
-            "划词时自动弹出即时翻译（开）" if checked else "划词时自动弹出即时翻译（关）"
-        )
-
-    def _open_quick_translate(self) -> None:
-        if self._quick_translate_dialog is None:
-            self._quick_translate_dialog = QuickTranslateDialog(self)
-        self._quick_translate_dialog.set_profile(self._settings.translation_profile())
-        self._quick_translate_dialog.refresh_theme()
-        self._quick_translate_dialog._position_bottom_right()
-        self._quick_translate_dialog.show()
-        self._quick_translate_dialog.raise_()
-        self._quick_translate_dialog.activateWindow()
-
-    def _on_text_selected(self, text: str) -> None:
-        if not text.strip():
-            return
-        if not self._auto_popup_quick:
-            # 用户关闭了划词自动弹出（仅用于阅读/高亮，不打扰浏览）
-            return
-        self._open_quick_translate()
-        if self._quick_translate_dialog:
-            self._quick_translate_dialog.set_profile(self._settings.translation_profile())
-            self._quick_translate_dialog.set_source_text(text, auto_translate=True)
-
-    def _on_viewer_translate_requested(self, text: str) -> None:
-        """浮动工具栏「翻译」→ 打开即时翻译并自动翻译（不受划词自动弹出开关影响）"""
-        if not text.strip():
-            return
-        self._open_quick_translate()
-        if self._quick_translate_dialog:
-            self._quick_translate_dialog.set_profile(self._settings.translation_profile())
-            self._quick_translate_dialog.set_source_text(text, auto_translate=True)
-
-    def _on_finished(self, event: TranslationEvent) -> None:
-        self._progress.setValue(self._progress.maximum())
-        self._settings.set_status(f"翻译完成 — 耗时 {event.elapsed_seconds:.1f}s")
-
-        self._dual_path = event.dual_pdf_path
-        self._mono_path = event.mono_pdf_path
-
-        # 根据用户选择决定展示哪个
-        task = self._settings.build_task(str(self._current_pdf))
-        if task.output_mode == "mono":
-            target = self._mono_path
-        else:
-            target = self._dual_path or self._mono_path
-
-        if target and target.exists():
-            self._tab_bar.setTabEnabled(1, True)
-            self._tab_bar.setCurrentIndex(1)
-            self._viewer.load_pdf(str(target))
-            self._download_btn.setEnabled(True)
-            self._update_zoom_label()
-            # 刷新历史记录
-            self._history.refresh()
-        else:
-            QMessageBox.warning(self, "结果缺失", "翻译流程已完成，但未生成输出文件。")
-
-    def _on_error(self, event: TranslationEvent) -> None:
-        self._settings.set_status(f"{event.message}", is_error=True)
-        QMessageBox.critical(self, "翻译错误", f"{event.message}\n\n{event.error_details}")
-
-    def _on_download(self) -> None:
-        target = self._dual_path or self._mono_path
-        if not target or not target.exists():
-            QMessageBox.information(self, "提示", "没有可下载的翻译结果")
-            return
-        dest, _ = QFileDialog.getSaveFileName(self, "保存翻译结果", target.name, "PDF 文件 (*.pdf)")
-        if dest:
-            try:
-                shutil.copy2(str(target), str(dest))
-                self._settings.set_status(f"已保存: {Path(dest).name}")
-            except Exception as exc:
-                QMessageBox.critical(self, "保存失败", str(exc))
-
-    # ═══════════════════════════════════════════════════════════
-    # 历史记录
-    # ═══════════════════════════════════════════════════════════
-
-    def _on_history_selected(self, dual_path: str, mono_path: str, name: str) -> None:
-        """点击历史记录中的翻译"""
-        target = dual_path or mono_path
-        if not target:
-            return
-        path = Path(target)
-        if not path.exists():
-            QMessageBox.warning(self, "文件不存在", f"历史文件已失效:\n{path}")
-            return
-        self._dual_path = Path(dual_path) if dual_path else None
-        self._mono_path = Path(mono_path) if mono_path else None
-
-        self._viewer.load_pdf(target)
-        self._setup_minimap()
-        self._tab_bar.setCurrentIndex(0)
-        self._tab_bar.setTabEnabled(1, True)
-        self._download_btn.setEnabled(bool(target))
-        self._settings.set_pdf_loaded(name, loaded=False)
-        self._settings.set_status(f"历史: {name}")
-
-    def _on_output_mode_changed(self) -> None:
-        """输出模式下拉框变更时，若正在查看历史记录则切换双栏/单栏"""
-        # 仅在有历史双栏+单栏文件时生效
-        if not (self._dual_path and self._mono_path):
-            return
-        mode = self._settings._output_mode_combo.currentData()
-        if mode == "mono" and self._mono_path.exists():
-            self._viewer.load_pdf(str(self._mono_path))
-            self._setup_minimap()
-        elif mode == "dual" and self._dual_path.exists():
-            self._viewer.load_pdf(str(self._dual_path))
-            self._setup_minimap()
-
-    # ═══════════════════════════════════════════════════════════
-    # 缩略图导航
-    # ═══════════════════════════════════════════════════════════
-
-    def _setup_minimap(self) -> None:
-        """为当前 PDF 生成缩略图并加载到 minimap（默认隐藏，通过按钮唤起）"""
-        doc = self._viewer.document
-        from PySide6.QtPdf import QPdfDocument
-        if doc is None or doc.status() != QPdfDocument.Status.Ready:
-            return
-        try:
-            thumbs = generate_thumbnails(doc, self._viewer.page_count)
-            self._minimap.load_document(self._viewer.page_count, thumbs)
-            self._position_minimap()
-            # 监听滚动条变化（仅首次连接，避免重复）
-            if not self._minimap_synced:
-                self._viewer.verticalScrollBar().valueChanged.connect(
-                    self._update_minimap_viewport
-                )
-                self._minimap_synced = True
-            # 立即初始化视口指示器（布局未完成时内部自动重试）
-            self._update_minimap_viewport()
-        except Exception:
-            logger.debug("Failed to generate thumbnails", exc_info=True)
-
-    def _position_minimap(self) -> None:
-        """将 minimap 定位到 viewer 右上角（并随高度重算面板与滚动范围）"""
-        self._minimap.refresh_geometry()
-        x = self._viewer.width() - self._minimap.width() - 8
-        y = 8
-        self._minimap.move(x, y)
-        self._minimap.raise_()
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        if self._minimap.isVisible():
-            self._position_minimap()
-
-    def _update_minimap_viewport(self) -> None:
-        """根据当前滚动位置更新 minimap 的视口指示器。
-
-        比值统一以「内容总高 = scrollbar_max + pageStep」为分母，
-        保证指示器高度恒定（修复拖到最下方时指示器缩成一条线）。
-        """
-        vbar = self._viewer.verticalScrollBar()
-        page = vbar.pageStep()
-        total_h = vbar.maximum() + page
-        if total_h <= 0:
-            # 布局尚未完成：文档已加载则稍后重试
-            if self._viewer.page_count > 0:
-                QTimer.singleShot(100, self._update_minimap_viewport)
-            return
-        ratio_start = vbar.value() / total_h
-        ratio_end = min((vbar.value() + page) / total_h, 1.0)
-        self._minimap.set_visible_range(ratio_start, ratio_end)
-
-    def _on_minimap_page_clicked(self, page_number: int) -> None:
-        """点击 minimap 缩略图 → 跳转到对应页面"""
-        self._viewer.goto_page(page_number)
-
-    def _on_minimap_dragged(self, ratio: float) -> None:
-        """拖拽 minimap 视口指示器 → 实时滚动 PDF（视口中心对齐拖拽点）"""
-        vbar = self._viewer.verticalScrollBar()
-        page = vbar.pageStep()
-        total_h = vbar.maximum() + page
-        if total_h <= 0:
-            return
-        v = int(ratio * total_h - page / 2)
-        vbar.setValue(max(0, min(v, vbar.maximum())))
-
-    # ═══════════════════════════════════════════════════════════
     # 拖拽
     # ═══════════════════════════════════════════════════════════
 
@@ -941,4 +587,9 @@ class MainWindow(QMainWindow):
                 self._load_pdf(str(path.resolve()))
                 event.acceptProposedAction()
                 return
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._minimap.isVisible():
+            self._position_minimap()
 

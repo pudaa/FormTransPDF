@@ -25,7 +25,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QAbstractButton
 
-from src.ui.theme import theme_manager, _contrast_text
+from src.ui.base.theme import theme_manager, _contrast_text
 
 
 def _data_root() -> Path:
@@ -44,7 +44,8 @@ def _data_root() -> Path:
             return exe_dir                        # Nuitka 兜底
     except Exception:
         pass
-    return Path(__file__).resolve().parent.parent  # 开发模式：项目 src/
+    # src/ui/base/icon_factory.py → 上三级即项目 src/（打包分支已提前返回）
+    return Path(__file__).resolve().parents[2]  # 开发模式：项目 src/
 
 
 ICON_DIR = _data_root() / "resources" / "icons"
