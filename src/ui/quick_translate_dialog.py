@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QMouseEvent, QTextCursor, QTextOption
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt
+from PySide6.QtGui import QFontMetrics, QMouseEvent, QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -29,6 +29,7 @@ from src.core.text_translator import (
     normalize_translation_profile,
     translate_text,
 )
+from src.ui.icon_factory import svg_icon
 from src.ui.theme import ThemePalette, theme_manager, _contrast_text
 
 LANGUAGE_OPTIONS = [
@@ -50,7 +51,7 @@ class QuickTranslateDialog(QDialog):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setMinimumSize(600, 440)
+        self.setMinimumSize(480, 400)
         self.setModal(False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
@@ -86,31 +87,29 @@ class QuickTranslateDialog(QDialog):
         self._drag_handle = QFrame()
         self._drag_handle.setObjectName("qtDragHandle")
         self._drag_handle.installEventFilter(self)
-        drag_layout = QVBoxLayout(self._drag_handle)
+        drag_layout = QHBoxLayout(self._drag_handle)
         drag_layout.setContentsMargins(0, 0, 0, 0)
-        drag_layout.setSpacing(2)
+        drag_layout.setSpacing(8)
 
-        title_box = QVBoxLayout()
-        title_box.setSpacing(2)
         title = QLabel("即时翻译")
         title.setObjectName("qtTitle")
-        subtitle = QLabel("短文本快速翻译")
-        subtitle.setObjectName("qtSubtitle")
-        subtitle.setWordWrap(True)
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        drag_layout.addLayout(title_box)
+        drag_layout.addWidget(title)
 
         self._service_label = QLabel()
         self._service_label.setObjectName("qtService")
-        self._service_label.setWordWrap(False)
-        drag_layout.addWidget(self._service_label)
+        self._service_label.setMaximumWidth(300)
+        drag_layout.addWidget(self._service_label, stretch=1)
 
         header.addWidget(self._drag_handle, stretch=1)
 
-        self._close_btn = QPushButton("✕")
+        self._close_btn = QPushButton("")
         self._close_btn.setObjectName("qtCloseBtn")
-        self._close_btn.setFixedSize(30, 30)
+        self._close_btn.setFixedSize(32, 32)
+        self._close_btn.setIconSize(QSize(18, 18))
+        self._close_btn.setIcon(
+            svg_icon("close", theme_manager.palette.text_secondary, 18)
+        )
+        self._close_btn.setToolTip("关闭")
         self._close_btn.clicked.connect(self.close)
         header.addWidget(self._close_btn)
 
@@ -136,19 +135,24 @@ class QuickTranslateDialog(QDialog):
         profile_row.addWidget(self._target_combo, stretch=1)
         self._card_layout.addLayout(profile_row)
 
-        self._card_layout.addWidget(self._section_label("原文"))
+        # ── 原文 / 译文：字段标签与文本框组合为带边框整体，中间用分隔线划分 ──
         self._source_edit = QPlainTextEdit()
         self._source_edit.setPlaceholderText("在这里输入或粘贴需要即时翻译的文本")
         self._source_edit.textChanged.connect(self._update_translate_hint)
-        self._source_edit.setMinimumHeight(120)
-        self._card_layout.addWidget(self._source_edit)
+        self._source_edit.setFixedHeight(140)
+        self._card_layout.addWidget(self._make_field("原文", self._source_edit))
 
-        self._card_layout.addWidget(self._section_label("译文"))
+        self._divider = QWidget()
+        self._divider.setObjectName("qtDivider")
+        self._divider.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._divider.setFixedHeight(1)
+        self._card_layout.addWidget(self._divider)
+
         self._target_edit = QPlainTextEdit()
         self._target_edit.setReadOnly(True)
         self._target_edit.setPlaceholderText("译文会显示在这里")
-        self._target_edit.setMinimumHeight(120)
-        self._card_layout.addWidget(self._target_edit)
+        self._target_edit.setFixedHeight(140)
+        self._card_layout.addWidget(self._make_field("译文", self._target_edit))
 
         footer = QHBoxLayout()
         footer.setSpacing(8)
@@ -169,10 +173,19 @@ class QuickTranslateDialog(QDialog):
         footer.addWidget(self._translate_btn)
         self._card_layout.addLayout(footer)
 
-    def _section_label(self, text: str) -> QLabel:
+    def _make_field(self, text: str, edit: QPlainTextEdit) -> QFrame:
+        """字段容器：小标签 + 文本框 组合为一个带边框的整体。"""
+        frame = QFrame()
+        frame.setObjectName("qtField")
+        frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(10, 6, 10, 8)
+        lay.setSpacing(4)
         label = QLabel(text)
-        label.setObjectName("qtSection")
-        return label
+        label.setObjectName("qtFieldLabel")
+        lay.addWidget(label)
+        lay.addWidget(edit)
+        return frame
 
     def set_profile(self, profile: dict[str, str] | TextTranslationProfile) -> None:
         if isinstance(profile, TextTranslationProfile):
@@ -239,9 +252,15 @@ class QuickTranslateDialog(QDialog):
             f"QDialog {{ background-color: transparent; }}"
             f"QFrame#qtCard {{ background-color: {tp.background.name()}; border: 1px solid {tp.divider.name()}; border-radius: 14px; }}"
             f"QFrame#qtDragHandle {{ background-color: transparent; }}"
-            f"QLabel#qtTitle {{ color: {tp.accent.name()}; font-size: 18pt; font-weight: 700; }}"
-            f"QLabel#qtSubtitle {{ color: {tp.text_secondary.name()}; font-size: 9pt; }}"
-            f"QLabel#qtSection {{ color: {tp.text_primary.name()}; font-size: 9pt; font-weight: 600; background: transparent; }}"
+            f"QLabel#qtTitle {{ color: {tp.accent.name()}; font-size: 15pt; font-weight: 700; }}"
+            f"QLabel#qtFieldLabel {{ color: {tp.accent.name()}; font-size: 9pt; font-weight: 700; background: transparent; }}"
+            f"QFrame#qtField {{"
+            f"  background-color: {tp.surface.name()};"
+            f"  border: 1px solid {tp.divider.name()};"
+            f"  border-radius: 10px;"
+            f"}}"
+            f"QFrame#qtField QPlainTextEdit {{ background-color: transparent; border: none; }}"
+            f"QWidget#qtDivider {{ background-color: {tp.divider.name()}; }}"
             f"QLabel#qtPill {{ color: {_contrast_text(tp.accent).name()}; background-color: {tp.accent.name()};"
             f" border-radius: 10px; padding: 4px 10px; font-size: 9pt; }}"
             f"QLabel#qtService {{ color: {tp.text_secondary.name()}; font-size: 9pt; }}"
@@ -281,6 +300,7 @@ class QuickTranslateDialog(QDialog):
         self._target_edit.setTabChangesFocus(False)
         self._source_edit.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self._target_edit.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self._close_btn.setIcon(svg_icon("close", tp.text_secondary, 18))
         self._update_service_summary()
         self._apply_button_state(False)
 
@@ -307,13 +327,12 @@ class QuickTranslateDialog(QDialog):
                     target_lang,
                 )
             except TextTranslationError as exc:
-                self._target_edit.setPlainText("")
-                self._set_status(str(exc), is_error=True)
+                self._show_translation_error(str(exc))
             except Exception as exc:  # pragma: no cover - UI guardrail
-                self._target_edit.setPlainText("")
-                self._set_status(f"翻译失败：{exc}", is_error=True)
+                self._show_translation_error(f"翻译失败：{exc}")
             else:
                 self._target_edit.setPlainText(translated)
+                self._set_target_error_style(False)
                 self._set_status("翻译完成", is_error=False)
             finally:
                 self._apply_button_state(False)
@@ -334,13 +353,22 @@ class QuickTranslateDialog(QDialog):
         self._translator_label.setText(self._profile.translator.upper())
         model_text = self._profile.model or "默认模型"
         base_text = self._profile.base_url or "默认地址"
-        self._service_label.setText(f"{model_text} · {base_text}")
+        self._set_service_text(f"{model_text} · {base_text}")
         self._update_service_summary()
+
+    def _set_service_text(self, text: str) -> None:
+        """设置服务摘要文本，超出宽度时右侧省略，完整文本放入 tooltip。"""
+        max_w = self._service_label.width() if self._service_label.width() > 40 else 320
+        elided = QFontMetrics(self._service_label.font()).elidedText(
+            text, Qt.TextElideMode.ElideRight, max_w
+        )
+        self._service_label.setText(elided)
+        self._service_label.setToolTip(text)
 
     def _update_service_summary(self) -> None:
         source = self._language_label(self._source_combo.currentData())
         target = self._language_label(self._target_combo.currentData())
-        self._service_label.setText(
+        self._set_service_text(
             f"{self._profile.translator.upper()} · {source} → {target} · {self._profile.base_url or '默认接口'}"
         )
 
@@ -369,10 +397,29 @@ class QuickTranslateDialog(QDialog):
         color = tp.error.name() if is_error else tp.text_secondary.name()
         self._status_label.setStyleSheet(f"color: {color}; font-size: 9.5pt;")
         self._status_label.setText(text)
+        # 错误信息较长时悬停可查看完整内容（完整信息已展示在译文区）
+        self._status_label.setToolTip(text if is_error and len(text) > 72 else "")
+
+    def _set_target_error_style(self, error: bool) -> None:
+        """译文框颜色：错误时用主题错误色，正常时恢复默认。"""
+        if error:
+            self._target_edit.setStyleSheet(
+                f"color: {theme_manager.palette.error.name()};"
+            )
+        else:
+            self._target_edit.setStyleSheet("")
+
+    def _show_translation_error(self, message: str) -> None:
+        """在译文区完整呈现错误信息（不撑大弹窗），状态栏显示简短摘要。"""
+        self._set_target_error_style(True)
+        self._target_edit.setPlainText(message)
+        summary = message if len(message) <= 72 else message[:72].rstrip() + "…"
+        self._set_status(summary, is_error=True)
 
     def _clear_all(self) -> None:
         self._source_edit.clear()
         self._target_edit.clear()
+        self._set_target_error_style(False)
         self._set_status("已清空", is_error=False)
 
     def eventFilter(self, obj, event):

@@ -18,7 +18,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEasingCurve, QVariantAnimation
+from PySide6.QtCore import Qt, QEasingCurve, QSettings, QVariantAnimation
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,12 +39,13 @@ from src.core.signals import TranslationEvent, TranslationTask, TranslationSigna
 from src.core.translator import TranslationEngine
 from src.ui.quick_translate_dialog import QuickTranslateDialog
 from src.ui.pdf_viewer import PDFViewer
-from src.ui.settings_panel import SettingsPanel
+from src.ui.settings_panel import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
 from src.ui.icon_factory import IconHoverFilter, accent_icon
 from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
 from src.ui.widgets.drop_zone import DropZone
 from src.ui.widgets.history_panel import HistoryPanel
 from src.ui.widgets.minimap import MinimapPanel, generate_thumbnails
+from src.ui.widgets.switch import Switch
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,12 @@ class MainWindow(QMainWindow):
         self.resize(self.DEFAULT_W, self.DEFAULT_H)
 
         self._output_dir = _get_output_dir()
+
+        # 划词自动弹出即时翻译开关（工具栏可切换，持久化保存）
+        self._app_settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._auto_popup_quick = bool(
+            self._app_settings.value("quick_translate_auto_popup", True, type=bool)
+        )
 
         # 窗口图标已在 app.py 中通过 QApplication.setWindowIcon 统一设置，
         # Windows 任务栏图标需要 QApplication 级别的图标，此处不再重复设置。
@@ -195,21 +202,22 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(6)
+        layout.setSpacing(0)
 
         brand = QLabel("FormTransPDF")
         brand.setObjectName("brandLabel")
+        brand.setStyleSheet(f"background: transparent;")
         brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(brand)
 
         sub = QLabel("科学论文翻译工坊")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setStyleSheet(f"color: {tp.text_secondary.name()}; font-size: 9pt; font-style: italic;")
+        sub.setStyleSheet(f"color: {tp.text_secondary.name()}; font-size: 9pt; font-style: italic; padding-bottom: 4px; background: transparent;")
         layout.addWidget(sub)
 
-        self._drop_zone = DropZone()
-        self._drop_zone.setMinimumHeight(72)
-        layout.addWidget(self._drop_zone)
+        # self._drop_zone = DropZone()
+        # self._drop_zone.setMinimumHeight(72)
+        # layout.addWidget(self._drop_zone)
 
         self._settings = SettingsPanel()
         layout.addWidget(self._settings)
@@ -284,6 +292,15 @@ class MainWindow(QMainWindow):
         self._translate_quick_btn, _ = self._make_tool_icon_btn("translate", "即时翻译选中文本", width=38)
         self._translate_quick_btn.clicked.connect(self._open_quick_translate)
         layout.addWidget(self._translate_quick_btn)
+
+        # 划词自动弹出即时翻译开关（Switch 组件；关闭后划词仅高亮不弹窗）
+        self._auto_translate_switch = Switch()
+        self._auto_translate_switch.setToolTip(
+            "划词时自动弹出即时翻译（开）" if self._auto_popup_quick else "划词时自动弹出即时翻译（关）"
+        )
+        self._auto_translate_switch.setChecked(self._auto_popup_quick)
+        self._auto_translate_switch.toggled.connect(self._on_auto_translate_toggled)
+        layout.addWidget(self._auto_translate_switch)
 
         # 分隔
         sep = QFrame()
@@ -455,6 +472,8 @@ class MainWindow(QMainWindow):
             self._theme_icon_filter.set_icon_name("sun" if theme_manager.is_dark else "moon")
         for hover in self._icon_hovers:
             hover.refresh_theme()
+        if hasattr(self, "_auto_translate_switch"):
+            self._auto_translate_switch.refresh_theme()
         if hasattr(self, "_settings"):
             self._settings.refresh_theme()
         if hasattr(self, "_history"):
@@ -535,7 +554,7 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════
 
     def _connect_signals(self) -> None:
-        self._drop_zone.pdf_dropped.connect(self._on_pdf_received)
+        # self._drop_zone.pdf_dropped.connect(self._on_pdf_received)
         self._settings.select_btn.clicked.connect(self._on_select_file)
         self._settings.translate_btn.clicked.connect(self._on_translate)
         self._signals.progress.connect(self._on_progress)
@@ -642,6 +661,15 @@ class MainWindow(QMainWindow):
         self._progress.setValue(event.current)
         self._settings.set_status(event.message)
 
+    def _on_auto_translate_toggled(self, checked: bool) -> None:
+        """划词自动弹出即时翻译开关（持久化保存 + 更新提示）"""
+        self._auto_popup_quick = checked
+        self._app_settings.setValue("quick_translate_auto_popup", checked)
+        self._app_settings.sync()
+        self._auto_translate_switch.setToolTip(
+            "划词时自动弹出即时翻译（开）" if checked else "划词时自动弹出即时翻译（关）"
+        )
+
     def _open_quick_translate(self) -> None:
         if self._quick_translate_dialog is None:
             self._quick_translate_dialog = QuickTranslateDialog(self)
@@ -654,6 +682,9 @@ class MainWindow(QMainWindow):
 
     def _on_text_selected(self, text: str) -> None:
         if not text.strip():
+            return
+        if not self._auto_popup_quick:
+            # 用户关闭了划词自动弹出（仅用于阅读/高亮，不打扰浏览）
             return
         self._open_quick_translate()
         if self._quick_translate_dialog:

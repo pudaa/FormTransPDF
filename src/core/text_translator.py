@@ -12,6 +12,7 @@ import asyncio
 import html
 import json
 import re
+import ssl
 import unicodedata
 import urllib.error
 import urllib.request
@@ -64,6 +65,68 @@ DEFAULT_FALLBACK_MODEL = {
 
 
 UNSUPPORTED_DIRECT_SERVICES = {"deepl"}
+
+
+def _certifi_cafile() -> str | None:
+    """返回 certifi 的 CA 证书包路径；不可用时返回 None。"""
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return None
+
+
+def _create_ssl_context(tls12_only: bool = False) -> ssl.SSLContext:
+    """创建 SSL 上下文，优先使用 certifi 的 CA 证书包。
+
+    规避 Windows 证书库中存在 OpenSSL 无法解析的损坏证书时，
+    ssl.load_default_certs() 报 [ASN1: NOT_ENOUGH_DATA] not enough data 的问题
+    （cafile 指定后 create_default_context 会跳过 load_default_certs）。
+
+    tls12_only=True 时限制最大 TLS 版本为 1.2（应对部分服务器/中间设备
+    对 TLS 1.3 握手处理不当的情况）。
+    """
+    cafile = _certifi_cafile()
+    try:
+        ctx = (
+            ssl.create_default_context(cafile=cafile)
+            if cafile
+            else ssl.create_default_context()
+        )
+    except (ssl.SSLError, OSError):
+        # 兜底：证书库 / CA 包均不可用时，退化为不校验服务端证书
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    if tls12_only:
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def _is_ssl_handshake_failure(exc: BaseException) -> bool:
+    """判断异常是否为 TLS 握手失败（值得回退 TLS 版本重试）。"""
+    if isinstance(exc, ssl.SSLError):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, ssl.SSLError)
+    return False
+
+
+def _urlopen_with_tls_fallback(request, timeout: int = 60):
+    """打开 HTTPS 请求（使用 certifi 证书包构建 SSL 上下文）。
+
+    若 TLS 1.3 握手失败，回退到 TLS 1.2 重试一次。
+    """
+    try:
+        return urllib.request.urlopen(
+            request, timeout=timeout, context=_create_ssl_context()
+        )
+    except OSError as exc:
+        if not _is_ssl_handshake_failure(exc):
+            raise
+        return urllib.request.urlopen(
+            request, timeout=timeout, context=_create_ssl_context(tls12_only=True)
+        )
 
 
 async def translate_text(
@@ -156,15 +219,16 @@ def _translate_text_sync(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen_with_tls_fallback(request) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         raise TextTranslationError(
-            f"翻译请求失败：HTTP {exc.code} {exc.reason}。{_shorten(body)}"
+            f"翻译请求失败：HTTP {exc.code} {exc.reason}。{_extract_error_detail(body)}"
         ) from exc
-    except urllib.error.URLError as exc:
-        raise TextTranslationError(f"翻译请求失败：{exc.reason}") from exc
+    except (urllib.error.URLError, ssl.SSLError, OSError) as exc:
+        reason = getattr(exc, "reason", None) or exc
+        raise TextTranslationError(f"翻译请求失败：{reason}") from exc
 
     data = json.loads(raw)
     translated = _extract_text(data)
@@ -408,3 +472,26 @@ def _shorten(text: str, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "…"
+
+
+def _extract_error_detail(body: str) -> str:
+    """从 HTTP 错误响应体中提取可读的错误信息。
+
+    优先解析 OpenAI 兼容格式 {"error": {"message": ...}} / {"message": ...}，
+    否则回退为原始响应体（截断到 500 字符）。
+    """
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return _shorten(body, 500)
+    message = None
+    if isinstance(data, dict):
+        err = data.get("error", data)
+        message = err.get("message") if isinstance(err, dict) else str(err)
+        if not message:
+            message = data.get("message")
+    if message:
+        return _shorten(str(message), 500)
+    return _shorten(body, 500)

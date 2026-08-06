@@ -446,6 +446,7 @@ QLabel#brandLabel {{
     font-family: "Cormorant Garamond", "Microsoft YaHei", serif;
     font-size: 22pt; font-weight: 600;
     color: {c.accent.name()}; letter-spacing: 1px;
+    background: transparent;
 }}
 QLabel#fileLabel {{
     color: {c.text_secondary.name()};
