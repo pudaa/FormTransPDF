@@ -61,6 +61,84 @@ def _pre_import_translator_impls() -> None:
             logger.debug("Pre-import of %s failed (not critical)", mod_name)
 
 
+# ── 翻译引擎规格：app translator key → (pdf2zh_next 引擎类型, {设置字段: task 字段}) ──
+# 字段名取自 pdf2zh_next.config.translate_engine_model 中各引擎设置类的实际字段。
+# 注意：pdf2zh_next 通过 translate_engine_type 判别字段实例化对应翻译器，
+# 必须为所选引擎创建对应类型的设置对象并整体替换，否则会静默回退到默认的
+# SiliconFlowFree 引擎（此前的 setattr 方式就是这样失效的）。
+_ENGINE_SPECS: dict[str, tuple[str, dict[str, str]]] = {
+    "openai": (
+        "OpenAI",
+        {
+            "openai_model": "model",
+            "openai_api_key": "api_key",
+            "openai_base_url": "base_url",
+        },
+    ),
+    "deepseek": (
+        "DeepSeek",
+        {"deepseek_model": "model", "deepseek_api_key": "api_key"},
+    ),
+    "deepl": ("DeepL", {"deepl_auth_key": "api_key"}),
+    "google": ("Google", {}),
+    "bing": ("Bing", {}),
+    # Ollama 使用 ollama_host（不是 *_base_url）
+    "ollama": (
+        "Ollama",
+        {"ollama_model": "model", "ollama_host": "base_url"},
+    ),
+    "zhipu": (
+        "Zhipu",
+        {"zhipu_model": "model", "zhipu_api_key": "api_key"},
+    ),
+    "siliconflow": (
+        "SiliconFlow",
+        {
+            "siliconflow_model": "model",
+            "siliconflow_api_key": "api_key",
+            "siliconflow_base_url": "base_url",
+        },
+    ),
+    "gemini": (
+        "Gemini",
+        {"gemini_model": "model", "gemini_api_key": "api_key"},
+    ),
+    "groq": (
+        "Groq",
+        {"groq_model": "model", "groq_api_key": "api_key"},
+    ),
+    "grok": (
+        "Grok",
+        {"grok_model": "model", "grok_api_key": "api_key"},
+    ),
+    "xinference": (
+        "Xinference",
+        {"xinference_model": "model", "xinference_host": "base_url"},
+    ),
+    # 界面上 label 为 “Azure OpenAI”，对应 AzureOpenAI 引擎
+    "azure": (
+        "AzureOpenAI",
+        {
+            "azure_openai_model": "model",
+            "azure_openai_api_key": "api_key",
+            "azure_openai_base_url": "base_url",
+        },
+    ),
+    "qwenmt": (
+        "QwenMt",
+        {
+            "qwenmt_model": "model",
+            "qwenmt_api_key": "api_key",
+            "qwenmt_base_url": "base_url",
+        },
+    ),
+    "claudecode": (
+        "ClaudeCode",
+        {"claude_code_model": "model"},
+    ),
+}
+
+
 class TranslationEngine:
     """
     封装 pdf2zh-next 翻译流水线（重型依赖延迟加载）。
@@ -86,6 +164,7 @@ class TranslationEngine:
         self._config_manager = None
         self._do_translate_async_stream = None
         self._BabelDOCConfig = None
+        self._engine_metadata_map = None
 
     # ── 加载与状态 ──────────────────────────────────────────
 
@@ -109,6 +188,9 @@ class TranslationEngine:
                 return
             try:
                 from pdf2zh_next.config import ConfigManager
+                from pdf2zh_next.config.translate_engine_model import (
+                    TRANSLATION_ENGINE_METADATA_MAP,
+                )
                 from pdf2zh_next.high_level import (
                     BabelDOCConfig,
                     do_translate_async_stream,
@@ -116,6 +198,7 @@ class TranslationEngine:
                 self._config_manager = ConfigManager()
                 self._do_translate_async_stream = do_translate_async_stream
                 self._BabelDOCConfig = BabelDOCConfig
+                self._engine_metadata_map = TRANSLATION_ENGINE_METADATA_MAP
                 # Nuitka 兼容：预导入动态加载的 translator_impl 模块
                 _pre_import_translator_impls()
                 self._ready = True
@@ -151,52 +234,51 @@ class TranslationEngine:
         #    如需术语表，可后期通过专门工具生成。
         settings.translation.no_auto_extract_glossary = True
 
+        # -- 扫描件处理：检测到大量"扫描页"时自动启用 OCR workaround --
+        #    babeldoc 的扫描检测会把"带整页背景图 + 文本层"的 PDF（Zotero
+        #    来源的论文很常见）误判为扫描件；默认会直接抛
+        #    "Scanned PDF detected." 错误终止翻译。
+        #    开启该选项后，检测到大量扫描页时 babeldoc 会自动切换为
+        #    OCR workaround 模式（黑字白底 + 跳过富文本翻译）继续处理，
+        #    而不是报错终止。对正常 PDF 无任何影响（仅在误判时生效）。
+        settings.pdf.auto_enable_ocr_workaround = True
+
         # -- 翻译引擎设置 --
-        ts = settings.translate_engine_settings
+        # 关键点：pdf2zh_next 的 translate_engine_settings 是带判别字段
+        # (translate_engine_type) 的联合类型，必须为所选引擎创建**对应类型**的
+        # 设置对象并整体替换。此前代码只是在默认的 SiliconFlowFreeSettings
+        # 对象上 setattr（如 ollama_model），字段不存在 → 静默失败，
+        # 导致无论选择什么引擎都回退到 SiliconFlowFree。
         svc = task.translator.lower()
-
-        # 将服务名映射到设置字段前缀
-        field_map: dict[str, str] = {
-            "openai": "openai",
-            "deepseek": "deepseek",
-            "deepl": "deepl",
-            "google": "google",
-            "bing": "bing",
-            "ollama": "ollama",
-            "zhipu": "zhipu",
-            "siliconflow": "siliconflow",
-            "gemini": "gemini",
-            "groq": "groq",
-            "grok": "grok",
-            "xinference": "xinference",
-            "azure": "azure",
-            "tencent": "tencent",
-            "anythingllm": "anythingllm",
-            "dify": "dify",
-            "qwenmt": "qwenmt",
-            "claudecode": "claudecode",
-        }
-
-        prefix = field_map.get(svc, "openai")
-
-        # 动态设置属性（仅当值非空）
-        if task.api_key:
-            try:
-                setattr(ts, f"{prefix}_api_key", task.api_key)
-            except Exception:
-                logger.debug("Setting %s_api_key failed — may not exist", prefix)
-
-        if task.model:
-            try:
-                setattr(ts, f"{prefix}_model", task.model)
-            except Exception:
-                logger.debug("Setting %s_model failed — may not exist", prefix)
-
-        if task.base_url:
-            try:
-                setattr(ts, f"{prefix}_base_url", task.base_url)
-            except Exception:
-                logger.debug("Setting %s_base_url failed — may not exist", prefix)
+        spec = _ENGINE_SPECS.get(svc)
+        if spec is not None and self._engine_metadata_map is not None:
+            engine_type, engine_fields = spec
+            metadata = self._engine_metadata_map.get(engine_type)
+            if metadata is not None:
+                new_ts = metadata.setting_model_type()
+                task_values = {
+                    "model": task.model,
+                    "api_key": task.api_key,
+                    "base_url": task.base_url,
+                }
+                for field_name, task_attr in engine_fields.items():
+                    value = task_values.get(task_attr)
+                    if value:
+                        try:
+                            setattr(new_ts, field_name, value)
+                        except Exception:
+                            logger.debug(
+                                "Setting %s on %s failed — may not exist",
+                                field_name,
+                                engine_type,
+                            )
+                settings.translate_engine_settings = new_ts
+                logger.info(
+                    "Translation engine: %s (model=%s, base_url=%s)",
+                    engine_type,
+                    task.model or "(default)",
+                    task.base_url or "(default)",
+                )
 
         return settings
 

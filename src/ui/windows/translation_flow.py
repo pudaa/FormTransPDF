@@ -2,7 +2,7 @@
 翻译流程 — 引擎后台加载、翻译编排、即时翻译弹窗管理。
 
 以 mixin 形式注入 MainWindow（windows/main_window.py），
-依赖 self._settings / self._viewer / self._tab_bar / self._progress /
+依赖 self._settings / self._viewer / self._progress / self._set_active_view /
 self._engine / self._signals 等由 MainWindow.__init__ 初始化的状态。
 """
 
@@ -256,12 +256,10 @@ class _TranslationFlowMixin:
             target = self._dual_path or self._mono_path
 
         if target and target.exists():
-            self._tab_bar.setTabEnabled(1, True)
-            self._tab_bar.setCurrentIndex(1)
-            self._viewer.load_pdf(str(target))
-            self._download_btn.setEnabled(True)
+            # 当前文档标签页切到「译文」视图并加载结果（_apply_doc_view 内同步下载按钮）
+            self._set_active_view("result")
             self._update_zoom_label()
-            # 刷新历史记录
+            # 刷新历史记录（含新写入的 sidecar）
             self._history.refresh()
         else:
             QMessageBox.warning(self, "结果缺失", "翻译流程已完成，但未生成输出文件。")

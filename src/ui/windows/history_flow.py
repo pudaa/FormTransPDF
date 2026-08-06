@@ -2,8 +2,8 @@
 历史流程 — 历史记录回放与输出模式切换。
 
 以 mixin 形式注入 MainWindow（windows/main_window.py），
-依赖 self._viewer / self._tab_bar / self._download_btn / self._settings /
-self._dual_path / self._mono_path 等由 MainWindow.__init__ 初始化的状态。
+依赖 self._viewer / self._doc_tabs / self._doc_tab_bar / self._download_btn /
+self._settings 等由 MainWindow.__init__ 初始化的状态。
 """
 
 from __future__ import annotations
@@ -12,35 +12,27 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QMessageBox
 
+from src.ui.widgets.document_tab_bar import DocumentTab
+
 
 class _HistoryFlowMixin:
     """历史记录选择与双栏/单栏切换。"""
 
     def _apply_history_result(self, entry) -> bool:
-        """加载一条已有翻译结果（复用检测 / 历史回放），按当前输出模式展示。
+        """加载一条已有翻译结果（复用检测），作用于当前文档标签页。
 
-        与 _on_finished 的展示逻辑一致。成功返回 True；结果文件缺失返回 False。
+        成功返回 True；结果文件缺失返回 False。
         """
-        dual = entry.dual_pdf
-        mono = entry.mono_pdf
-        self._dual_path = dual
-        self._mono_path = mono
+        tab = self._active_doc_tab()
+        if tab is None:
+            return False
+        tab.dual_pdf = entry.dual_pdf
+        tab.mono_pdf = entry.mono_pdf
+        tab.view = "result"
 
-        mode = "dual"
-        if getattr(self, "_current_pdf", None):
-            try:
-                mode = self._settings.build_task(str(self._current_pdf)).output_mode
-            except Exception:
-                mode = "dual"
-
-        target = mono if mode == "mono" else (dual or mono)
+        target = self._result_target(tab)
         if target and target.exists():
-            self._viewer.load_pdf(str(target))
-            self._setup_minimap()
-            self._tab_bar.setCurrentIndex(1)
-            self._tab_bar.setTabEnabled(1, True)
-            self._download_btn.setEnabled(True)
-            self._update_zoom_label()
+            self._apply_doc_view(tab)
             self._settings.set_status(f"已复用翻译结果：{entry.display_name}")
             return True
 
@@ -48,7 +40,7 @@ class _HistoryFlowMixin:
         return False
 
     def _on_history_selected(self, dual_path: str, mono_path: str, name: str) -> None:
-        """点击历史记录中的翻译"""
+        """点击历史记录中的翻译 → 以新文档标签页打开该翻译结果。"""
         target = dual_path or mono_path
         if not target:
             return
@@ -56,15 +48,26 @@ class _HistoryFlowMixin:
         if not path.exists():
             QMessageBox.warning(self, "文件不存在", f"历史文件已失效:\n{path}")
             return
-        self._dual_path = Path(dual_path) if dual_path else None
-        self._mono_path = Path(mono_path) if mono_path else None
 
-        self._viewer.load_pdf(target)
-        self._setup_minimap()
-        self._tab_bar.setCurrentIndex(0)
-        self._tab_bar.setTabEnabled(1, True)
-        self._download_btn.setEnabled(bool(target))
-        self._settings.set_pdf_loaded(name, loaded=False)
+        # 去重：该结果文件已作为标签打开则切换到已有标签页
+        for i, tab in enumerate(self._doc_tabs):
+            if tab.source_pdf and tab.source_pdf.resolve() == path.resolve():
+                self._activate_doc_tab(i)
+                return
+
+        # 历史结果标签页：无真实源文件，仅展示译文
+        tab = DocumentTab(
+            title=name,
+            source_pdf=path,
+            dual_pdf=Path(dual_path) if dual_path else None,
+            mono_pdf=Path(mono_path) if mono_path else None,
+            view="result",
+            has_source=False,
+        )
+        self._doc_tabs.append(tab)
+        self._doc_tab_bar.add_tab(tab.title)
+        self._activate_doc_tab(len(self._doc_tabs) - 1)
+        self._settings.set_pdf_loaded(name, loaded=False)  # 历史结果不可再翻译
         self._settings.set_status(f"历史: {name}")
 
     def _on_output_mode_changed(self) -> None:

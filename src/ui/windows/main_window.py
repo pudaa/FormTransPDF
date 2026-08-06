@@ -4,9 +4,10 @@
 ┌──────────────────────────────────────────────────────────┐
 │ ☰  FormTransPDF       [−] 适应 [+] │ 暗色主题 │ 下载译文      │
 ├────────┬─────────────────────────────────────────────────┤
-│ 可收起 │  ┌ 原始文档 ─── 翻译结果 ──────────────────┐   │
-│ 侧边栏 │  │           PDFViewer（单窗口）            │   │
-│ 280px  │  └──────────────────────────────────────────┘   │
+│ 可收起 │  [文档标签页 ...]          [原文] [译文]          │
+│ 侧边栏 │  ┌──────────────────────────────────────────┐   │
+│ 280px  │  │           PDFViewer（多标签页）            │   │
+│        │  └──────────────────────────────────────────┘   │
 └────────┴─────────────────────────────────────────────────┘
 """
 
@@ -29,7 +30,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QTabBar,
     QVBoxLayout,
     QWidget,
 )
@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 from src.core.signals import TranslationSignals
 from src.core.translation.engine import TranslationEngine
 from src.core.translation.records import compute_source_fingerprint
-from src.ui.base.icon_factory import IconHoverFilter, accent_icon
+from src.ui.base.icon_factory import IconHoverFilter, accent_icon, svg_icon
 from src.ui.base.theme import ThemePalette, theme_manager, _contrast_text
 from src.ui.dialogs.quick_translate import QuickTranslateDialog
 from src.ui.panels.settings import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
@@ -46,6 +46,7 @@ from src.ui.windows.history_flow import _HistoryFlowMixin
 from src.ui.windows.minimap_controller import _MinimapControllerMixin
 from src.ui.windows.sidebar_behavior import _SidebarBehaviorMixin
 from src.ui.windows.translation_flow import _EngineLoader, _TranslationFlowMixin
+from src.ui.widgets.document_tab_bar import DocumentTab, DocumentTabBar, _adjust_index
 from src.ui.widgets.drop_zone import DropZone
 from src.ui.widgets.history_panel import HistoryPanel
 from src.ui.widgets.minimap import MinimapPanel
@@ -139,12 +140,8 @@ class MainWindow(
         # 窗口图标已在 app.py 中通过 QApplication.setWindowIcon 统一设置，
         # Windows 任务栏图标需要 QApplication 级别的图标，此处不再重复设置。
 
-        self._current_pdf: Path | None = None
-        self._mono_path: Path | None = None
-        self._dual_path: Path | None = None
-        # 源文件指纹（重复提交复用检测；_load_pdf 时计算）
-        self._current_pdf_hash: str | None = None
-        self._current_pdf_bytes_hash: str | None = None
+        self._doc_tabs: list[DocumentTab] = []
+        self._active_doc_index = -1
         # viewer 高度缓存（minimap 跟随重定位时避免重复重算面板）
         self._last_viewer_h: int | None = None
         self._sidebar_visible = True
@@ -175,6 +172,71 @@ class MainWindow(
     def _tp(self) -> ThemePalette:
         return theme_manager.palette
 
+    # ═══════════════════════════════════════════════════════════
+    # 文档标签页状态（属性路由到活动标签，兼容既有代码读写）
+    # ═══════════════════════════════════════════════════════════
+
+    def _active_doc_tab(self) -> DocumentTab | None:
+        """返回活动文档标签；无标签时返回 None。"""
+        if 0 <= self._active_doc_index < len(self._doc_tabs):
+            return self._doc_tabs[self._active_doc_index]
+        return None
+
+    @property
+    def _current_pdf(self) -> Path | None:
+        tab = self._active_doc_tab()
+        return tab.source_pdf if tab else None
+
+    @_current_pdf.setter
+    def _current_pdf(self, value: Path | None) -> None:
+        tab = self._active_doc_tab()
+        if tab:
+            tab.source_pdf = value
+
+    @property
+    def _mono_path(self) -> Path | None:
+        tab = self._active_doc_tab()
+        return tab.mono_pdf if tab else None
+
+    @_mono_path.setter
+    def _mono_path(self, value: Path | None) -> None:
+        tab = self._active_doc_tab()
+        if tab:
+            tab.mono_pdf = value
+
+    @property
+    def _dual_path(self) -> Path | None:
+        tab = self._active_doc_tab()
+        return tab.dual_pdf if tab else None
+
+    @_dual_path.setter
+    def _dual_path(self, value: Path | None) -> None:
+        tab = self._active_doc_tab()
+        if tab:
+            tab.dual_pdf = value
+
+    @property
+    def _current_pdf_hash(self) -> str | None:
+        tab = self._active_doc_tab()
+        return tab.source_hash if tab else None
+
+    @_current_pdf_hash.setter
+    def _current_pdf_hash(self, value: str | None) -> None:
+        tab = self._active_doc_tab()
+        if tab:
+            tab.source_hash = value or ""
+
+    @property
+    def _current_pdf_bytes_hash(self) -> str | None:
+        tab = self._active_doc_tab()
+        return tab.source_bytes_hash if tab else None
+
+    @_current_pdf_bytes_hash.setter
+    def _current_pdf_bytes_hash(self, value: str | None) -> None:
+        tab = self._active_doc_tab()
+        if tab:
+            tab.source_bytes_hash = value or ""
+
     def _build_ui(self) -> None:
         tp = self._tp
         central = QWidget()
@@ -202,8 +264,8 @@ class MainWindow(
         self._toolbar = self._build_toolbar()
         main_layout.addWidget(self._toolbar)
 
-        self._tab_bar = self._build_tab_bar()
-        main_layout.addWidget(self._tab_bar)
+        self._tab_row = self._build_tab_row()
+        main_layout.addWidget(self._tab_row)
 
         self._viewer = PDFViewer()
         self._viewer.text_selected.connect(self._on_text_selected)
@@ -429,40 +491,209 @@ class MainWindow(
             f"color: {tp.text_secondary.name()}; font-size: 10pt; background: transparent;"
         )
 
-    # ── 标签栏 ───────────────────────────────────────────────
+    # ── 标签行（文档标签页 + 原文/译文切换，单行合并）────────
 
-    def _build_tab_bar(self) -> QTabBar:
-        bar = QTabBar()
-        bar.addTab(accent_icon("document", 16), " 原始文档")
-        bar.addTab(accent_icon("web", 16), " 翻译结果")
-        bar.setCurrentIndex(0)
-        bar.setTabEnabled(1, False)
-        bar.currentChanged.connect(self._on_tab_changed)
-        self._tab_bar_widget = bar
-        self._apply_tab_styles()
-        return bar
+    def _build_tab_row(self) -> QWidget:
+        row = QWidget()
+        row.setFixedHeight(DocumentTabBar.BAR_HEIGHT + 4)
+        self._tab_row_widget = row
 
-    def _apply_tab_styles(self) -> None:
-        tp = self._tp
-        if not hasattr(self, "_tab_bar_widget"):
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 2, 8, 0)
+        layout.setSpacing(6)
+
+        # 多文档标签页（浏览器式，可关闭）
+        self._doc_tab_bar = DocumentTabBar()
+        self._doc_tab_bar.tab_activated.connect(self._on_doc_tab_activated)
+        self._doc_tab_bar.tab_close_requested.connect(self._on_doc_tab_close_requested)
+        self._doc_tab_bar.tabs_reordered.connect(self._on_doc_tabs_reordered)
+        layout.addWidget(self._doc_tab_bar, stretch=1)
+
+        # 原文/译文切换（作用于当前文档标签页，各标签独立记忆）
+        self._view_source_btn = self._make_view_toggle("原文", self._on_view_source)
+        self._view_result_btn = self._make_view_toggle("译文", self._on_view_result)
+        self._view_source_btn.setToolTip("查看原始文档")
+        self._view_result_btn.setToolTip("查看翻译结果")
+        layout.addWidget(self._view_source_btn)
+        layout.addWidget(self._view_result_btn)
+
+        self._sync_view_toggle_ui()
+        return row
+
+    def _make_view_toggle(self, text: str, slot) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setFixedHeight(24)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setCheckable(True)
+        btn.clicked.connect(slot)
+        return btn
+
+    def _on_view_source(self) -> None:
+        self._set_active_view("source")
+
+    def _on_view_result(self) -> None:
+        self._set_active_view("result")
+
+    def _set_active_view(self, view: str) -> None:
+        """设置当前文档标签页的视图（原文/译文）并加载。"""
+        tab = self._active_doc_tab()
+        if not tab:
             return
-        bar = self._tab_bar_widget
-        bar.setStyleSheet(
-            f"QTabBar {{ background-color: {tp.background.name()}; }}"
-            f"QTabBar::tab {{"
-            f"  background: {tp.surface.name()}; color: {tp.text_secondary.name()};"
-            f"  border: none; padding: 6px 20px; margin-right: 2px;"
-            f"  border-bottom: 2px solid transparent; font-size: 10pt;"
-            f"}}"
-            f"QTabBar::tab:selected {{"
-            f"  color: {tp.accent.name()}; background: {tp.canvas.name()};"
-            f"  border-bottom: 2px solid {tp.accent.name()};"
-            f"}}"
-            f"QTabBar::tab:hover:!selected {{"
-            f"  color: {tp.text_primary.name()}; background: {tp.surface_hover.name()};"
-            f"}}"
-            f"QTabBar::tab:disabled {{ color: {tp.text_disabled.name()}; }}"
+        tab.view = view
+        self._apply_doc_view(tab)
+
+    def _result_target(self, tab: DocumentTab) -> Path | None:
+        """按输出模式返回应展示的译文文件（dual 优先 / mono）。"""
+        mode = "dual"
+        try:
+            if tab.source_pdf:
+                mode = self._settings.build_task(str(tab.source_pdf)).output_mode
+        except Exception:
+            pass
+        if mode == "mono":
+            return tab.mono_pdf or tab.dual_pdf
+        return tab.dual_pdf or tab.mono_pdf
+
+    def _apply_doc_view(self, tab: DocumentTab) -> None:
+        """按标签页的视图状态把对应文档加载到 viewer。"""
+        if tab.view == "result":
+            target = self._result_target(tab)
+        else:
+            target = tab.source_pdf if tab.has_source else None
+        if target and target.exists():
+            self._viewer.load_pdf(str(target))
+        else:
+            self._viewer.clear()
+        self._setup_minimap()
+        self._update_zoom_label()
+        self._sync_view_toggle_ui()
+        self._sync_download_btn()
+
+    def _sync_view_toggle_ui(self) -> None:
+        """刷新原文/译文按钮的可用性与选中态。"""
+        tab = self._active_doc_tab()
+        has_source = bool(tab and tab.has_source and tab.source_pdf and tab.source_pdf.exists())
+        result = self._result_target(tab) if tab else None
+        has_result = bool(result and result.exists())
+        self._view_source_btn.setEnabled(has_source)
+        self._view_result_btn.setEnabled(has_result)
+        view = tab.view if tab else "source"
+        self._view_source_btn.setChecked(view == "source")
+        self._view_result_btn.setChecked(view == "result")
+        # 关键：选中态变化后必须立即重刷样式，否则按钮视觉不随状态更新（无保持态）
+        self._apply_tab_row_styles()
+
+    def _sync_download_btn(self) -> None:
+        tab = self._active_doc_tab()
+        target = self._result_target(tab) if tab else None
+        self._download_btn.setEnabled(bool(target and target.exists()))
+
+    def _apply_tab_row_styles(self) -> None:
+        tp = self._tp
+        if not hasattr(self, "_tab_row_widget"):
+            return
+        self._tab_row_widget.setStyleSheet(f"background-color: {tp.background.name()};")
+        if not hasattr(self, "_view_source_btn"):
+            return
+        for btn, icon_name in (
+            (self._view_source_btn, "document"),
+            (self._view_result_btn, "web"),
+        ):
+            if btn.isChecked():
+                icon_color = _contrast_text(tp.accent)
+                style = (
+                    f"QPushButton {{ background-color: {tp.accent.name()};"
+                    f"color: {icon_color.name()};"
+                    f"border: 1px solid {tp.accent.name()}; border-radius: 4px;"
+                    f"font-size: 9pt; padding: 0 10px; }}"
+                )
+            else:
+                icon_color = tp.accent if btn.isEnabled() else tp.text_disabled
+                style = (
+                    f"QPushButton {{ background-color: transparent;"
+                    f"color: {tp.text_secondary.name()};"
+                    f"border: 1px solid {tp.divider.name()}; border-radius: 4px;"
+                    f"font-size: 9pt; padding: 0 10px; }}"
+                    f"QPushButton:hover {{ background-color: {tp.surface_hover.name()};"
+                    f"color: {tp.text_primary.name()}; }}"
+                    f"QPushButton:disabled {{ color: {tp.text_disabled.name()};"
+                    f"border-color: {tp.divider.name()}; }}"
+                )
+            btn.setIcon(svg_icon(icon_name, icon_color, 14))
+            btn.setStyleSheet(style)
+
+    # ═══════════════════════════════════════════════════════════
+    # 文档标签页管理
+    # ═══════════════════════════════════════════════════════════
+
+    def _on_doc_tab_activated(self, index: int) -> None:
+        if index == self._active_doc_index:
+            return
+        self._activate_doc_tab(index)
+
+    def _on_doc_tab_close_requested(self, index: int) -> None:
+        self._close_doc_tab(index)
+
+    def _on_doc_tabs_reordered(self, from_index: int, to_index: int) -> None:
+        """标签拖拽重排：同步文档数据列表与活动索引。"""
+        if from_index == to_index:
+            return
+        if not (0 <= from_index < len(self._doc_tabs)) or not (0 <= to_index < len(self._doc_tabs)):
+            return
+        tab = self._doc_tabs.pop(from_index)
+        self._doc_tabs.insert(to_index, tab)
+        self._active_doc_index = _adjust_index(self._active_doc_index, from_index, to_index)
+
+    def _activate_doc_tab(self, index: int) -> None:
+        """激活指定文档标签页：切换状态并把其视图加载到 viewer。"""
+        if not (0 <= index < len(self._doc_tabs)):
+            return
+        self._active_doc_index = index
+        self._doc_tab_bar.set_active(index)
+        tab = self._doc_tabs[index]
+        self._apply_doc_view(tab)
+        self._settings.set_pdf_loaded(
+            str(tab.source_pdf) if tab.source_pdf else "",
+            loaded=tab.has_source,  # 历史结果标签（无源文件）不可翻译
         )
+        self._settings.set_status(f"文档: {tab.title}")
+
+    def _close_doc_tab(self, index: int) -> None:
+        """关闭文档标签页；关闭最后一个后显示空状态。"""
+        if not (0 <= index < len(self._doc_tabs)):
+            return
+        self._doc_tabs.pop(index)
+        self._doc_tab_bar.remove_tab(index)
+
+        if not self._doc_tabs:
+            self._active_doc_index = -1
+            self._doc_tab_bar.set_active(-1)
+            self._show_empty_state()
+            return
+
+        # 相邻激活：关闭活动标签时优先右侧、其次左侧
+        active = self._active_doc_index
+        if active == index:
+            active = index if index < len(self._doc_tabs) else len(self._doc_tabs) - 1
+        elif active > index:
+            active -= 1
+        self._active_doc_index = active
+        self._doc_tab_bar.set_active(active)
+        tab = self._doc_tabs[active]
+        self._apply_doc_view(tab)
+        self._settings.set_pdf_loaded(
+            str(tab.source_pdf) if tab.source_pdf else "",
+            loaded=tab.has_source,
+        )
+
+    def _show_empty_state(self) -> None:
+        """无打开文档：显示空状态占位。"""
+        self._viewer.clear()
+        self._download_btn.setEnabled(False)
+        self._view_source_btn.setEnabled(False)
+        self._view_result_btn.setEnabled(False)
+        self._settings.set_pdf_loaded("", loaded=False)
+        self._settings.set_status("就绪 — 请载入 PDF")
 
     # ═══════════════════════════════════════════════════════════
     # 主题切换
@@ -482,7 +713,7 @@ class MainWindow(
         self._sidebar.setStyleSheet(f"QWidget#sidebar {{ background-color: {tp.background.name()}; }}")
         self._sidebar_sep.setStyleSheet(f"color: {tp.divider.name()};")
         self._apply_toolbar_styles()
-        self._apply_tab_styles()
+        self._apply_tab_row_styles()
 
         # 更新主题按钮图标与所有主题色 SVG 图标
         self._refresh_icons()
@@ -495,10 +726,8 @@ class MainWindow(
 
     def _refresh_icons(self) -> None:
         """主题切换后按新主题重建所有 SVG 图标颜色"""
-        if hasattr(self, "_tab_bar_widget"):
-            bar = self._tab_bar_widget
-            bar.setTabIcon(0, accent_icon("document", 16))
-            bar.setTabIcon(1, accent_icon("web", 16))
+        if hasattr(self, "_doc_tab_bar"):
+            self._doc_tab_bar.refresh_theme()
         if self._theme_icon_filter is not None:
             self._theme_icon_filter.set_icon_name("sun" if theme_manager.is_dark else "moon")
         for hover in self._icon_hovers:
@@ -545,58 +774,47 @@ class MainWindow(
             QMessageBox.warning(self, "文件不存在", f"找不到文件:\n{path}")
             return
 
-        self._current_pdf = pdf_path
-        self._mono_path = None
-        self._dual_path = None
+        # 去重：同一文件已作为标签打开 → 切换到已有标签页
+        for i, tab in enumerate(self._doc_tabs):
+            if tab.source_pdf and tab.source_pdf.resolve() == pdf_path.resolve():
+                self._activate_doc_tab(i)
+                return
 
         # ── 计算源文件指纹（内容+字节），用于「已翻译过则复用」检测 ──
         # 论文 PDF 通常很小，同步计算可接受；失败则跳过复用检测。
-        self._current_pdf_hash = None
-        self._current_pdf_bytes_hash = None
+        content_hash: str | None = None
+        bytes_hash: str | None = None
         try:
-            self._current_pdf_hash, self._current_pdf_bytes_hash = compute_source_fingerprint(pdf_path)
+            content_hash, bytes_hash = compute_source_fingerprint(pdf_path)
         except Exception:
             logger.debug("Failed to fingerprint source pdf", exc_info=True)
 
-        # 若该文件已翻译过，给出可复用提示（真正复用发生在点击「翻译」时）
-        if self._current_pdf_hash or self._current_pdf_bytes_hash:
-            reuse = self._history.find_by_hash(
-                self._current_pdf_hash or "", self._current_pdf_bytes_hash or ""
-            )
-            if reuse is not None:
-                self._settings.set_status(
-                    f"已找到该文件的翻译记录（{reuse.display_name}），点击「翻译」可直接复用"
-                )
-
-        self._viewer.clear()
+        # ── 新建文档标签页并激活（_activate_doc_tab 内部加载到 viewer）──
+        tab = DocumentTab(
+            title=pdf_path.stem,
+            source_pdf=pdf_path,
+            view="source",
+            has_source=True,
+            source_hash=content_hash or "",
+            source_bytes_hash=bytes_hash or "",
+        )
+        self._doc_tabs.append(tab)
+        self._doc_tab_bar.add_tab(tab.title)
         try:
-            self._viewer.load_pdf(str(pdf_path))
-            # 生成缩略图并加载到 minimap
-            self._setup_minimap()
+            self._activate_doc_tab(len(self._doc_tabs) - 1)
         except Exception as exc:
             QMessageBox.critical(self, "PDF 加载失败", str(exc))
             return
 
-        self._tab_bar.setCurrentIndex(0)
-        self._tab_bar.setTabEnabled(1, False)
         self._download_btn.setEnabled(False)
-        self._settings.set_pdf_loaded(path, loaded=True)
-        self._update_zoom_label()
 
-    # ═══════════════════════════════════════════════════════════
-    # 标签切换
-    # ═══════════════════════════════════════════════════════════
-
-    def _on_tab_changed(self, index: int) -> None:
-        if index == 0 and self._current_pdf:
-            self._viewer.load_pdf(str(self._current_pdf))
-            self._setup_minimap()
-        elif index == 1:
-            target = self._dual_path or self._mono_path
-            if target and target.exists():
-                self._viewer.load_pdf(str(target))
-                self._setup_minimap()
-        self._update_zoom_label()
+        # 若该文件已翻译过，给出可复用提示（真正复用发生在点击「翻译」时）
+        if content_hash or bytes_hash:
+            reuse = self._history.find_by_hash(content_hash or "", bytes_hash or "")
+            if reuse is not None:
+                self._settings.set_status(
+                    f"已找到该文件的翻译记录（{reuse.display_name}），点击「翻译」可直接复用"
+                )
 
     # ═══════════════════════════════════════════════════════════
     # 拖拽
