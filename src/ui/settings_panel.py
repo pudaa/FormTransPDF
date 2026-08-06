@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.signals import TranslationTask
-from src.ui.theme import Colors, DIVIDER_STYLE
+from src.ui.icon_factory import accent_icon, svg_icon
+from src.ui.theme import Colors, DIVIDER_STYLE, _contrast_text, theme_manager
 
 # ═══════════════════════════════════════════════════════════════
 # 翻译服务元数据 + 常用模型列表
@@ -196,13 +197,17 @@ class SettingsPanel(QWidget):
         action_layout = QHBoxLayout()
         action_layout.setSpacing(6)
 
-        self._select_btn = QPushButton("📂 选择")
+        self._select_btn = QPushButton(" 选择")
+        self._select_btn.setIcon(accent_icon("file", 16))
         self._select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._select_btn.setToolTip("选择 PDF 文件")
         action_layout.addWidget(self._select_btn)
 
-        self._translate_btn = QPushButton("🚀 翻译")
+        self._translate_btn = QPushButton(" 翻译")
         self._translate_btn.setObjectName("primaryBtn")
+        self._translate_btn.setIcon(
+            svg_icon("translate", _contrast_text(theme_manager.palette.accent), 16)
+        )
         self._translate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._translate_btn.setEnabled(False)
         action_layout.addWidget(self._translate_btn)
@@ -286,7 +291,7 @@ class SettingsPanel(QWidget):
 
     def set_translating(self, active: bool) -> None:
         self._translate_btn.setEnabled(not active)
-        self._translate_btn.setText("⏳ 翻译中…" if active else "🚀 翻译")
+        self._translate_btn.setText("翻译中…" if active else "翻译")
         self._translator_combo.setEnabled(not active)
         self._lang_in_combo.setEnabled(not active)
         self._lang_out_combo.setEnabled(not active)
@@ -296,6 +301,14 @@ class SettingsPanel(QWidget):
         color = Colors.EMBER.name() if is_error else Colors.ASH.name()
         self._status_label.setStyleSheet(f"color: {color}; font-size: 10pt;")
         self._status_label.setText(text)
+
+    def refresh_theme(self) -> None:
+        """主题切换后刷新操作按钮图标颜色"""
+        tp = theme_manager.palette
+        self._select_btn.setIcon(accent_icon("file", 16))
+        self._translate_btn.setIcon(
+            svg_icon("translate", _contrast_text(tp.accent), 16)
+        )
 
     def build_task(self, pdf_path: str) -> TranslationTask:
         from pathlib import Path

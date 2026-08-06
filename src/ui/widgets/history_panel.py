@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ui.icon_factory import accent_icon
 from src.ui.theme import Colors
 
 
@@ -116,6 +117,10 @@ class HistoryPanel(QWidget):
         self._entries = self._scan_output_dir()
         self._rebuild_list()
 
+    def refresh_theme(self) -> None:
+        """主题切换后按新主题重建列表项图标"""
+        self._rebuild_list()
+
     def _scan_output_dir(self) -> list[HistoryEntry]:
         """扫描目录，按文件分组返回"""
         entries: dict[str, HistoryEntry] = {}
@@ -180,9 +185,7 @@ class HistoryPanel(QWidget):
 
         self._empty_label.setVisible(False)
         for entry in self._entries:
-            icon = "📄"
-            label = entry.display_name
-            item = QListWidgetItem(f"{icon}  {label}")
+            item = QListWidgetItem(accent_icon("document", 14), f"  {entry.display_name}")
             item.setData(Qt.ItemDataRole.UserRole, self._list.count() - 1)  # index
             item.setToolTip(self._build_tooltip(entry))
             self._list.addItem(item)

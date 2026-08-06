@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import QPainter, QColor
 
+from src.ui.icon_factory import svg_icon
 from src.ui.theme import theme_manager
 
 
@@ -143,7 +144,8 @@ class FloatingToolbar(QWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(2)
 
-        self.copy_btn = QPushButton("📋 复制")
+        self.copy_btn = QPushButton(" 复制")
+        self.copy_btn.setIcon(svg_icon("copy", "#2c2416", 14))
         self.copy_btn.setToolTip("复制到剪贴板")
         layout.addWidget(self.copy_btn)
 

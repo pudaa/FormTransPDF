@@ -455,7 +455,7 @@ class PDFViewer(QWidget):
         """复制选中文本到剪贴板"""
         if self._selected_text:
             QApplication.clipboard().setText(self._selected_text)
-            self._text_overlay.toolbar.copy_btn.setText("✓ 已复制")
+            self._text_overlay.toolbar.copy_btn.setText("已复制")
             QTimer.singleShot(1000, lambda: self._text_overlay.toolbar.copy_btn.setText("复制"))
 
     def _search_selected_text(self):

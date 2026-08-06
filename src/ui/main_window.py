@@ -2,7 +2,7 @@
 主窗口 — "Gilded Ink / Vellum" 双主题布局
 
 ┌──────────────────────────────────────────────────────────┐
-│ ☰  FormTransPDF       [−] 适应 [+] │ 暗色主题 │ ⬇ 下载译文   │
+│ ☰  FormTransPDF       [−] 适应 [+] │ 暗色主题 │ 下载译文      │
 ├────────┬─────────────────────────────────────────────────┤
 │ 可收起 │  ┌ 原始文档 ─── 翻译结果 ──────────────────┐   │
 │ 侧边栏 │  │           PDFViewer（单窗口）            │   │
@@ -40,6 +40,7 @@ from src.core.translator import TranslationEngine
 from src.ui.quick_translate_dialog import QuickTranslateDialog
 from src.ui.pdf_viewer import PDFViewer
 from src.ui.settings_panel import SettingsPanel
+from src.ui.icon_factory import IconHoverFilter, accent_icon
 from src.ui.theme import ThemeManager, ThemePalette, theme_manager, _contrast_text
 from src.ui.widgets.drop_zone import DropZone
 from src.ui.widgets.history_panel import HistoryPanel
@@ -124,6 +125,8 @@ class MainWindow(QMainWindow):
         self._minimap: MinimapPanel | None = None  # 在 _build_ui 中创建
         self._minimap_synced = False  # 滚动条信号是否已连接
         self._quick_translate_dialog: QuickTranslateDialog | None = None
+        self._icon_hovers: list = []  # IconHoverFilter 列表（主题切换时刷新）
+        self._theme_icon_filter: IconHoverFilter | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -261,19 +264,24 @@ class MainWindow(QMainWindow):
         for text, tip, slot in [
             ("−", "缩小 (Ctrl+滚轮)", lambda: self._viewer.zoom_out() or self._update_zoom_label()),
             ("+", "放大 (Ctrl+滚轮)", lambda: self._viewer.zoom_in() or self._update_zoom_label()),
-            ("↺", "重置缩放", lambda: self._viewer.zoom_reset() or self._update_zoom_label()),
         ]:
             btn = self._make_icon_btn(text, tip)
             btn.clicked.connect(slot)
             self._zoom_btns.append(btn)
             layout.addWidget(btn)
 
+        # 重置缩放：SVG 图标（reload）
+        reset_btn, _ = self._make_tool_icon_btn("reload", "重置缩放", width=32)
+        reset_btn.clicked.connect(lambda: self._viewer.zoom_reset() or self._update_zoom_label())
+        self._zoom_btns.append(reset_btn)
+        layout.addWidget(reset_btn)
+
         # 缩略图切换
-        self._minimap_btn = self._make_icon_btn("▦", "切换缩略图导航", width=38)
+        self._minimap_btn, _ = self._make_tool_icon_btn("thumbnail", "切换缩略图导航", width=38)
         self._minimap_btn.clicked.connect(lambda: self._minimap and self._minimap.toggle()) # 点击时切换缩略图导航
         layout.addWidget(self._minimap_btn)
 
-        self._translate_quick_btn = self._make_icon_btn("译", "即时翻译选中文本", width=38)
+        self._translate_quick_btn, _ = self._make_tool_icon_btn("translate", "即时翻译选中文本", width=38)
         self._translate_quick_btn.clicked.connect(self._open_quick_translate)
         layout.addWidget(self._translate_quick_btn)
 
@@ -283,16 +291,20 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet(f"color: {tp.divider.name()}; background: transparent;")
         layout.addWidget(sep)
 
-        # 主题切换
-        self._theme_btn = self._make_icon_btn("☀" if theme_manager.is_dark else "🌙", "切换亮色/暗色主题", width=40)
+        # 主题切换（暗色主题显示 sun，亮色主题显示 moon）
+        self._theme_btn, self._theme_icon_filter = self._make_tool_icon_btn(
+            "sun" if theme_manager.is_dark else "moon", "切换亮色/暗色主题", width=40
+        )
         self._theme_btn.clicked.connect(self._on_toggle_theme)
         layout.addWidget(self._theme_btn)
 
         # 下载
-        self._download_btn = QPushButton("⬇ 下载译文")
+        self._download_btn = QPushButton(" 下载译文")
         self._download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._download_btn.setEnabled(False)
         self._download_btn.setToolTip("将翻译结果保存到指定位置")
+        _dl_hover = IconHoverFilter(self._download_btn, "download", size=16)
+        self._icon_hovers.append(_dl_hover)
         self._download_btn.clicked.connect(self._on_download)
         layout.addWidget(self._download_btn)
 
@@ -305,6 +317,19 @@ class MainWindow(QMainWindow):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setToolTip(tooltip)
         return btn
+
+    def _make_tool_icon_btn(self, icon_name: str, tooltip: str, width: int = 32):
+        """创建带主题色 SVG 图标的工具栏按钮（hover 自动反色切换）。
+
+        返回 (按钮, IconHoverFilter)。
+        """
+        btn = QPushButton()
+        btn.setFixedSize(width, 28)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        hover = IconHoverFilter(btn, icon_name, size=18)
+        self._icon_hovers.append(hover)
+        return btn, hover
 
     def _apply_toolbar_styles(self) -> None:
         """应用/刷新顶栏样式（主题切换时调用）"""
@@ -361,8 +386,8 @@ class MainWindow(QMainWindow):
 
     def _build_tab_bar(self) -> QTabBar:
         bar = QTabBar()
-        bar.addTab("📄 原始文档")
-        bar.addTab("🌐 翻译结果")
+        bar.addTab(accent_icon("document", 16), " 原始文档")
+        bar.addTab(accent_icon("web", 16), " 翻译结果")
         bar.setCurrentIndex(0)
         bar.setTabEnabled(1, False)
         bar.currentChanged.connect(self._on_tab_changed)
@@ -411,14 +436,29 @@ class MainWindow(QMainWindow):
         self._apply_toolbar_styles()
         self._apply_tab_styles()
 
-        # 更新主题按钮图标
-        self._theme_btn.setText("☀" if theme_manager.is_dark else "🌙")
+        # 更新主题按钮图标与所有主题色 SVG 图标
+        self._refresh_icons()
 
         if self._quick_translate_dialog:
             self._quick_translate_dialog.refresh_theme()
 
         # 更新 PDF 容器背景
         self._viewer.refresh_theme()
+
+    def _refresh_icons(self) -> None:
+        """主题切换后按新主题重建所有 SVG 图标颜色"""
+        if hasattr(self, "_tab_bar_widget"):
+            bar = self._tab_bar_widget
+            bar.setTabIcon(0, accent_icon("document", 16))
+            bar.setTabIcon(1, accent_icon("web", 16))
+        if self._theme_icon_filter is not None:
+            self._theme_icon_filter.set_icon_name("sun" if theme_manager.is_dark else "moon")
+        for hover in self._icon_hovers:
+            hover.refresh_theme()
+        if hasattr(self, "_settings"):
+            self._settings.refresh_theme()
+        if hasattr(self, "_history"):
+            self._history.refresh_theme()
 
     # ═══════════════════════════════════════════════════════════
     # 侧边栏 / 缩放
@@ -622,7 +662,7 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, event: TranslationEvent) -> None:
         self._progress.setValue(self._progress.maximum())
-        self._settings.set_status(f"✅ 翻译完成 — 耗时 {event.elapsed_seconds:.1f}s")
+        self._settings.set_status(f"翻译完成 — 耗时 {event.elapsed_seconds:.1f}s")
 
         self._dual_path = event.dual_pdf_path
         self._mono_path = event.mono_pdf_path
@@ -646,7 +686,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "结果缺失", "翻译流程已完成，但未生成输出文件。")
 
     def _on_error(self, event: TranslationEvent) -> None:
-        self._settings.set_status(f"❌ {event.message}", is_error=True)
+        self._settings.set_status(f"{event.message}", is_error=True)
         QMessageBox.critical(self, "翻译错误", f"{event.message}\n\n{event.error_details}")
 
     def _on_download(self) -> None:
@@ -684,7 +724,7 @@ class MainWindow(QMainWindow):
         self._tab_bar.setTabEnabled(1, True)
         self._download_btn.setEnabled(bool(target))
         self._settings.set_pdf_loaded(name, loaded=False)
-        self._settings.set_status(f"📜 历史: {name}")
+        self._settings.set_status(f"历史: {name}")
 
     def _on_output_mode_changed(self) -> None:
         """输出模式下拉框变更时，若正在查看历史记录则切换双栏/单栏"""
