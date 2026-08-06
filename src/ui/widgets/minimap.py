@@ -83,6 +83,8 @@ class MinimapPanel(QWidget):
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         # 始终 "可见"，但默认 opacity=0（透明不可交互）
+        # 隐藏时透传鼠标事件：避免其 100px 宽区域成为 PDF/工具栏的点击盲区
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.show()
 
     # ── 公开方法 ────────────────────────────────────────────
@@ -147,6 +149,9 @@ class MinimapPanel(QWidget):
 
         currently_visible = self._opacity_effect.opacity() > 0.01
         target_opacity = 0.0 if currently_visible else 1.0
+
+        # 隐藏时透传鼠标事件（不拦截其区域点击）
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, target_opacity == 0.0)
 
         self._fade_anim = QPropertyAnimation(self._opacity_effect, b"opacity")
         self._fade_anim.setDuration(220)

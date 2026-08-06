@@ -212,6 +212,7 @@ class MainWindow(QMainWindow):
 
         self._viewer = PDFViewer()
         self._viewer.text_selected.connect(self._on_text_selected)
+        self._viewer.translate_requested.connect(self._on_viewer_translate_requested)
         main_layout.addWidget(self._viewer, stretch=1)
 
         # 缩略图导航（覆盖在 PDF 查看器右上角）
@@ -757,6 +758,15 @@ class MainWindow(QMainWindow):
             return
         if not self._auto_popup_quick:
             # 用户关闭了划词自动弹出（仅用于阅读/高亮，不打扰浏览）
+            return
+        self._open_quick_translate()
+        if self._quick_translate_dialog:
+            self._quick_translate_dialog.set_profile(self._settings.translation_profile())
+            self._quick_translate_dialog.set_source_text(text, auto_translate=True)
+
+    def _on_viewer_translate_requested(self, text: str) -> None:
+        """浮动工具栏「翻译」→ 打开即时翻译并自动翻译（不受划词自动弹出开关影响）"""
+        if not text.strip():
             return
         self._open_quick_translate()
         if self._quick_translate_dialog:

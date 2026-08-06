@@ -14,8 +14,12 @@ PDF 页面渲染与查看组件 — 基于 QPdfView (PySide6 QtPdf)
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QPoint, QEvent, QMargins, QRectF, QTimer, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPalette, QWheelEvent, QScreen
+import urllib.parse
+
+from PySide6.QtCore import Qt, QPoint, QEvent, QMargins, QRectF, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QMouseEvent, QPalette, QWheelEvent, QScreen,
+)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWidgets import (
@@ -47,7 +51,8 @@ class PDFViewer(QWidget):
     """
 
     # ========== 信号 ==========
-    text_selected = Signal(str)  # 当选中文本时发射
+    text_selected = Signal(str)          # 当选中文本时发射
+    translate_requested = Signal(str)    # 浮动工具栏「翻译」→ 主窗口即时翻译
 
     DEFAULT_SCALE = 1.0
     MIN_SCALE = 0.25
@@ -109,6 +114,8 @@ class PDFViewer(QWidget):
         # 连接浮动工具栏按钮
         toolbar = self._text_overlay.toolbar
         toolbar.copy_btn.clicked.connect(self._copy_selected_text)
+        toolbar.translate_btn.clicked.connect(self._on_toolbar_translate)
+        toolbar.search_btn.clicked.connect(self._on_toolbar_search)
         toolbar.close_btn.clicked.connect(self._clear_selection)
 
         # 事件过滤器：
@@ -452,11 +459,32 @@ class PDFViewer(QWidget):
     # ── 工具栏动作 ─────────────────────────────────────────
 
     def _copy_selected_text(self):
-        """复制选中文本到剪贴板"""
+        """复制选中文本到剪贴板（带「已复制」按钮态 + 弹窗气泡提示）"""
+        if not self._selected_text:
+            return
+        QApplication.clipboard().setText(self._selected_text)
+        self._text_overlay.toolbar.show_copied()
+        # 弹窗提示「已复制」（定位在选区下方）
+        rects = self._text_overlay._highlights
+        anchor = None
+        if rects:
+            united = rects[0]
+            for r in rects[1:]:
+                united = united.united(r)
+            anchor = united
+        self._text_overlay.show_toast("已复制", anchor)
+
+    def _on_toolbar_translate(self):
+        """浮动工具栏「翻译」：把选中文本交给主窗口的即时翻译。"""
         if self._selected_text:
-            QApplication.clipboard().setText(self._selected_text)
-            self._text_overlay.toolbar.copy_btn.setText("已复制")
-            QTimer.singleShot(1000, lambda: self._text_overlay.toolbar.copy_btn.setText("复制"))
+            self.translate_requested.emit(self._selected_text)
+
+    def _on_toolbar_search(self):
+        """浮动工具栏「搜索」：在浏览器中用 Google Scholar 检索选中文本。"""
+        if not self._selected_text:
+            return
+        query = urllib.parse.quote(self._selected_text.strip())
+        QDesktopServices.openUrl(QUrl(f"https://scholar.google.com/scholar?q={query}"))
 
     def _search_selected_text(self):
         """搜索选中文本"""
@@ -503,6 +531,15 @@ class PDFViewer(QWidget):
                     self.zoom_out()
                 return True
             return False  # 普通滚轮交给 QPdfView
+
+        # 文本选择仅处理 viewport 自身事件：浮动工具栏等子控件按下时
+        # 不进入选择逻辑（否则按下工具栏按钮会清空选中文本/隐藏工具栏）
+        if obj is not self._pdf_view.viewport() and event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseMove,
+            QEvent.Type.MouseButtonRelease,
+        ):
+            return False
 
         # 左键文本选择（带拖拽阈值，避免误触发和干扰 QPdfView）
         if event.type() == QEvent.Type.MouseButtonPress:
