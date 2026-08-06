@@ -53,4 +53,4 @@ class StartupSplash(QSplashScreen):
         hint_font.setItalic(True)
         painter.setFont(hint_font)
         painter.setPen(QColor("#6b6152"))
-        painter.drawText(20, 130, w - 40, 22, Qt.AlignmentFlag.AlignHCenter, "正在初始化翻译引擎…")
+        painter.drawText(20, 130, w - 40, 22, Qt.AlignmentFlag.AlignHCenter, "正在初始化…")

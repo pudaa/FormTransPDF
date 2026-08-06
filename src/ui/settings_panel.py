@@ -108,8 +108,10 @@ class SettingsPanel(QWidget):
         super().__init__(parent)
         self.setObjectName("settingsPanel")
         self._qsettings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._loading_settings = True  # 恢复期间抑制自动保存
         self._build_ui()
         self._restore_settings()
+        self._loading_settings = False
         self._on_translator_changed()
 
     # ── UI 构建 ─────────────────────────────────────────────
@@ -129,11 +131,13 @@ class SettingsPanel(QWidget):
         for key, meta in TRANSLATOR_OPTIONS.items():
             self._translator_combo.addItem(meta["label"], key)
         self._translator_combo.currentIndexChanged.connect(self._on_translator_changed)
+        self._translator_combo.currentIndexChanged.connect(self._auto_save)
         svc_layout.addRow("服务:", self._translator_combo)
 
         self._api_key_input = QLineEdit()
         self._api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self._api_key_input.setPlaceholderText("sk-...")
+        self._api_key_input.textChanged.connect(self._auto_save)
         svc_layout.addRow("API Key:", self._api_key_input)
 
         # 模型：可编辑下拉框
@@ -141,10 +145,12 @@ class SettingsPanel(QWidget):
         self._model_combo.setEditable(True)
         self._model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._model_combo.lineEdit().setPlaceholderText("输入或选择模型…")
+        self._model_combo.currentTextChanged.connect(self._auto_save)
         svc_layout.addRow("模型:", self._model_combo)
 
         self._base_url_input = QLineEdit()
         self._base_url_input.setPlaceholderText("留空使用默认")
+        self._base_url_input.textChanged.connect(self._auto_save)
         svc_layout.addRow("Base URL:", self._base_url_input)
 
         self._ollama_hint = QLabel("Ollama 无需 API Key；请确保服务已启动")
@@ -176,6 +182,8 @@ class SettingsPanel(QWidget):
             self._lang_out_combo.addItem(name, code)
         self._lang_in_combo.setCurrentText("English")
         self._lang_out_combo.setCurrentText("中文")
+        self._lang_in_combo.currentIndexChanged.connect(self._auto_save)
+        self._lang_out_combo.currentIndexChanged.connect(self._auto_save)
 
         lang_layout.addRow("源语言:", self._lang_in_combo)
         lang_layout.addRow("目标语言:", self._lang_out_combo)
@@ -184,6 +192,7 @@ class SettingsPanel(QWidget):
         self._output_mode_combo = QComboBox()
         self._output_mode_combo.addItem("双语对照（原文+译文双栏）", "dual")
         self._output_mode_combo.addItem("仅译文（纯译文单栏）", "mono")
+        self._output_mode_combo.currentIndexChanged.connect(self._auto_save)
         lang_layout.addRow("输出模式:", self._output_mode_combo)
 
         root.addWidget(lang_group)
@@ -217,6 +226,7 @@ class SettingsPanel(QWidget):
         # ── 状态 ──
         self._status_label = QLabel("就绪 — 请载入 PDF")
         self._status_label.setObjectName("statusLabel")
+        self._status_label.setStyleSheet(f"background: transparent;")
         self._status_label.setWordWrap(True)
         root.addWidget(self._status_label)
 
@@ -266,6 +276,13 @@ class SettingsPanel(QWidget):
         qs.setValue("lang_in", self._lang_in_combo.currentData())
         qs.setValue("lang_out", self._lang_out_combo.currentData())
         qs.setValue("output_mode", self._output_mode_combo.currentData())
+        qs.sync()  # 立即落盘，防止异常退出丢失设置
+
+    def _auto_save(self, *_args) -> None:
+        """设置变更时自动持久化（恢复期间不触发）。"""
+        if getattr(self, "_loading_settings", False):
+            return
+        self.save_settings()
 
     # ═══════════════════════════════════════════════════════════
     # 公有接口

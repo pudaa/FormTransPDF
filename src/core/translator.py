@@ -1,20 +1,25 @@
 """
-翻译引擎封装 — 将 pdf2zh-next 的 async generator 包装为可注入 Qt 信号的形式
+翻译引擎封装 — 将 pdf2zh-next 的 async generator 包装为可注入 Qt 信号的形式。
+
+重型依赖（pdf2zh_next / babeldoc，导入约 3-4 秒）采用延迟加载：
+__init__ 仅做轻量初始化，真正的模块导入在 load() 中由后台线程完成，
+避免阻塞应用启动。引擎就绪前调用翻译会抛出 EngineNotReadyError。
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import AsyncIterator
-
-from pdf2zh_next.config import ConfigManager
-from pdf2zh_next.config.model import SettingsModel
-from pdf2zh_next.high_level import do_translate_async_stream, BabelDOCConfig
 
 from .signals import TranslationEvent, TranslationTask, TranslationSignals
 
 logger = logging.getLogger(__name__)
+
+
+class EngineNotReadyError(RuntimeError):
+    """翻译引擎尚未加载完成时调用翻译所引发的异常。"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -56,27 +61,80 @@ def _pre_import_translator_impls() -> None:
             logger.debug("Pre-import of %s failed (not critical)", mod_name)
 
 
-# 在模块加载时执行一次预导入
-_pre_import_translator_impls()
-
-
 class TranslationEngine:
     """
-    封装 pdf2zh-next 翻译流水线。
+    封装 pdf2zh-next 翻译流水线（重型依赖延迟加载）。
+
+    pdf2zh_next / babeldoc 导入耗时约 3-4 秒，且仅在真正需要翻译时才有用。
+    因此 __init__ 只做轻量初始化；真正的模块导入在 load() 中完成，
+    由主窗口在后台线程调用，避免阻塞应用启动。引擎就绪前调用翻译会抛出
+    EngineNotReadyError。
 
     usage::
 
         engine = TranslationEngine()
+        engine.load()          # 后台线程中调用
         async for event in engine.run(task):
             signals.progress.emit(event)
     """
 
     def __init__(self) -> None:
-        self._config_manager = ConfigManager()
+        self._ready = False
+        self._load_error: Exception | None = None
+        self._lock = threading.Lock()
+        # 延迟加载的引用（load() 中填充）
+        self._config_manager = None
+        self._do_translate_async_stream = None
+        self._BabelDOCConfig = None
+
+    # ── 加载与状态 ──────────────────────────────────────────
+
+    @property
+    def is_ready(self) -> bool:
+        """引擎是否已加载完成。"""
+        return self._ready
+
+    @property
+    def load_error(self) -> Exception | None:
+        """最近一次加载失败的原因（未失败为 None）。"""
+        return self._load_error
+
+    def load(self) -> None:
+        """导入 pdf2zh_next / babeldoc 并预加载 translator_impl。
+
+        耗时约 3-4 秒，应由后台线程调用；重复调用幂等。
+        """
+        with self._lock:
+            if self._ready:
+                return
+            try:
+                from pdf2zh_next.config import ConfigManager
+                from pdf2zh_next.high_level import (
+                    BabelDOCConfig,
+                    do_translate_async_stream,
+                )
+                self._config_manager = ConfigManager()
+                self._do_translate_async_stream = do_translate_async_stream
+                self._BabelDOCConfig = BabelDOCConfig
+                # Nuitka 兼容：预导入动态加载的 translator_impl 模块
+                _pre_import_translator_impls()
+                self._ready = True
+                self._load_error = None
+                logger.info("Translation engine loaded")
+            except Exception as exc:
+                self._load_error = exc
+                logger.exception("Translation engine load failed")
+                raise
+
+    def _ensure_loaded(self) -> None:
+        """确保引擎已加载；否则抛出 EngineNotReadyError。"""
+        if not self._ready:
+            raise EngineNotReadyError("翻译引擎尚未加载完成，请稍候再试。")
 
     # ------------------------------------------------------------------
-    def build_settings(self, task: TranslationTask, output_dir: Path | None = None) -> SettingsModel:
+    def build_settings(self, task: TranslationTask, output_dir: Path | None = None):
         """从 TranslationTask 构建 SettingsModel"""
+        self._ensure_loaded()
         settings = self._config_manager.initialize_config()
 
         # -- 输出目录（避免散落到项目根目录）--
@@ -154,10 +212,11 @@ class TranslationEngine:
         :param signals: 可选的 Qt 信号集
         :param output_dir: 输出目录（默认 pdf2zh-next 使用当前 CWD）
         """
+        self._ensure_loaded()
         settings = self.build_settings(task, output_dir=output_dir)
 
         try:
-            async for raw_event in do_translate_async_stream(settings, task.input_pdf):
+            async for raw_event in self._do_translate_async_stream(settings, task.input_pdf):
                 event_type = raw_event.get("type", "")
 
                 # ── babeldoc 新版事件：progress_start / progress_update / progress_end ──

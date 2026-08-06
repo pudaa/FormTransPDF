@@ -396,9 +396,15 @@ class QuickTranslateDialog(QDialog):
         tp = theme_manager.palette
         color = tp.error.name() if is_error else tp.text_secondary.name()
         self._status_label.setStyleSheet(f"color: {color}; font-size: 9.5pt;")
-        self._status_label.setText(text)
-        # 错误信息较长时悬停可查看完整内容（完整信息已展示在译文区）
-        self._status_label.setToolTip(text if is_error and len(text) > 72 else "")
+        # 限制状态文本像素宽度：否则其 sizeHint 会撑大布局最小宽度，
+        # 导致弹窗重新打开时被拉宽（长宽比翻转）。完整文本放入 tooltip。
+        max_w = 260
+        elided = self._status_label.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideRight, max_w
+        )
+        self._status_label.setText(elided)
+        # 文本被截断时悬停可查看完整内容（完整信息已展示在译文区）
+        self._status_label.setToolTip(text if elided != text else "")
 
     def _set_target_error_style(self, error: bool) -> None:
         """译文框颜色：错误时用主题错误色，正常时恢复默认。"""

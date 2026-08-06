@@ -16,9 +16,10 @@ import asyncio
 import logging
 import shutil
 import sys
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEasingCurve, QSettings, QVariantAnimation
+from PySide6.QtCore import QObject, Qt, QEasingCurve, QSettings, QVariantAnimation, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.signals import TranslationEvent, TranslationTask, TranslationSignals
-from src.core.translator import TranslationEngine
+from src.core.translator import EngineNotReadyError, TranslationEngine
 from src.ui.quick_translate_dialog import QuickTranslateDialog
 from src.ui.pdf_viewer import PDFViewer
 from src.ui.settings_panel import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
@@ -95,6 +96,33 @@ def _get_output_dir() -> Path:
 # 主窗口
 # ═══════════════════════════════════════════════════════════════
 
+class _EngineLoader(QObject):
+    """在后台线程中加载翻译引擎，完成后通过信号通知主线程。"""
+
+    loaded = Signal()
+    failed = Signal(str)
+
+    def __init__(self, engine: TranslationEngine) -> None:
+        super().__init__()
+        self._engine = engine
+
+    def run(self) -> None:
+        try:
+            self._engine.load()
+        except Exception as exc:
+            logger.exception("Translation engine load failed")
+            self._safe_emit(self.failed, str(exc))
+        else:
+            self._safe_emit(self.loaded)
+
+    def _safe_emit(self, signal, *args) -> None:
+        """主窗口可能已销毁（用户提前关闭应用），此时静默忽略信号。"""
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
+
+
 class MainWindow(QMainWindow):
     """FormTransPDF 主窗口"""
 
@@ -129,6 +157,9 @@ class MainWindow(QMainWindow):
 
         self._signals = TranslationSignals()
         self._engine = TranslationEngine()
+        self._pending_translate = False  # 引擎就绪后自动续跑
+        self._engine_thread: threading.Thread | None = None
+        self._engine_worker: _EngineLoader | None = None
         self._minimap: MinimapPanel | None = None  # 在 _build_ui 中创建
         self._minimap_synced = False  # 滚动条信号是否已连接
         self._quick_translate_dialog: QuickTranslateDialog | None = None
@@ -139,6 +170,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._history.refresh()  # 启动时扫描已有记录
         self.setAcceptDrops(True)
+        self._start_engine_load()
 
     # ═══════════════════════════════════════════════════════════
     # UI 构建
@@ -627,7 +659,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请先选择 PDF 文件")
             return
 
+        # 先持久化设置：即使引擎未就绪/加载失败，用户的选择也必须保存
         self._settings.save_settings()
+
+        if not self._engine.is_ready:
+            if self._engine.load_error:
+                self._settings.set_status(
+                    f"翻译引擎不可用：{self._engine.load_error}", is_error=True
+                )
+                return
+            # 引擎仍在后台加载：挂起请求，就绪后自动开始
+            self._pending_translate = True
+            self._settings.set_status("翻译引擎加载中，就绪后自动开始…")
+            return
+
         task = self._settings.build_task(str(self._current_pdf))
 
         if task.api_key == "" and task.translator not in ("ollama", "xinference", "qwenmt"):
@@ -645,10 +690,37 @@ class MainWindow(QMainWindow):
         self._progress.setValue(0)
         asyncio.ensure_future(self._run_translate(task))
 
+    def _start_engine_load(self) -> None:
+        """后台线程加载翻译引擎（重型 pdf2zh_next/babeldoc 导入），不阻塞启动。"""
+        worker = _EngineLoader(self._engine)
+        worker.loaded.connect(self._on_engine_loaded)
+        worker.failed.connect(self._on_engine_load_failed)
+        self._engine_worker = worker
+        self._engine_thread = threading.Thread(
+            target=worker.run, name="engine-loader", daemon=True
+        )
+        self._settings.set_status("正在后台加载翻译引擎…")
+        self._engine_thread.start()
+
+    def _on_engine_loaded(self) -> None:
+        """翻译引擎加载完成：更新状态，若有挂起请求则自动开始翻译。"""
+        logger.info("Translation engine ready")
+        self._settings.set_status("翻译引擎就绪 — 可以开始翻译")
+        if self._pending_translate:
+            self._pending_translate = False
+            self._on_translate()
+
+    def _on_engine_load_failed(self, message: str) -> None:
+        """翻译引擎加载失败：提示用户，翻译功能不可用。"""
+        logger.error("Translation engine failed to load: %s", message)
+        self._settings.set_status(f"翻译引擎加载失败：{message}", is_error=True)
+
     async def _run_translate(self, task: TranslationTask) -> None:
         try:
             async for event in self._engine.run(task, self._signals, output_dir=self._output_dir):
                 pass
+        except EngineNotReadyError as exc:
+            self._settings.set_status(str(exc), is_error=True)
         except Exception as exc:
             logger.exception("Translation failed")
             QMessageBox.critical(self, "翻译异常", str(exc))
