@@ -12,6 +12,7 @@ import asyncio
 import logging
 import shutil
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -19,6 +20,12 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from src.core.signals import TranslationEvent, TranslationTask
 from src.core.translation.engine import EngineNotReadyError, TranslationEngine
+from src.core.translation.records import (
+    SourceInfo,
+    compute_source_fingerprint,
+    sidecar_path,
+    write_source_info,
+)
 from src.ui.dialogs.quick_translate import QuickTranslateDialog
 
 logger = logging.getLogger(__name__)
@@ -58,6 +65,25 @@ class _TranslationFlowMixin:
         if not self._current_pdf:
             QMessageBox.information(self, "提示", "请先选择 PDF 文件")
             return
+
+        # ── 复用检测：源文件指纹命中已有翻译结果 → 免翻译直接复用 ──
+        reuse = None
+        content_hash = getattr(self, "_current_pdf_hash", None)
+        bytes_hash = getattr(self, "_current_pdf_bytes_hash", None)
+        if content_hash or bytes_hash:
+            reuse = self._history.find_by_hash(content_hash or "", bytes_hash or "")
+        if reuse is not None:
+            reply = QMessageBox.question(
+                self,
+                "检测到已有翻译结果",
+                f"文件「{Path(self._current_pdf).name}」已翻译过"
+                f"（历史记录：{reuse.display_name}）。\n\n"
+                "是否直接复用已有结果，跳过翻译？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes and self._apply_history_result(reuse):
+                return
 
         # 先持久化设置：即使引擎未就绪/加载失败，用户的选择也必须保存
         self._settings.save_settings()
@@ -128,6 +154,46 @@ class _TranslationFlowMixin:
             self._settings.set_translating(False)
             self._progress.setVisible(False)
 
+    def _record_translation(self, event: TranslationEvent) -> None:
+        """将「源文件指纹 → 翻译结果」写入 sidecar，供后续重复提交复用。
+
+        sidecar 位于 output/{base}.zh.srcinfo.json；写入失败仅记日志，不影响主流程。
+        """
+        try:
+            # 从结果文件名推导结果组基名（如 xxx.zh.dual.pdf → xxx）
+            base = None
+            for p in (event.dual_pdf_path, event.mono_pdf_path):
+                if not p:
+                    continue
+                for suffix in (".zh.dual.pdf", ".zh.mono.pdf"):
+                    if p.name.endswith(suffix):
+                        base = p.name[: -len(suffix)]
+                        break
+                if base:
+                    break
+            if base is None or not self._current_pdf:
+                return
+
+            content_hash = getattr(self, "_current_pdf_hash", None)
+            bytes_hash = getattr(self, "_current_pdf_bytes_hash", None)
+            if not content_hash or not bytes_hash:
+                content_hash, bytes_hash = compute_source_fingerprint(self._current_pdf)
+
+            task = self._settings.build_task(str(self._current_pdf))
+            info = SourceInfo(
+                source_hash=content_hash,
+                source_bytes_hash=bytes_hash,
+                source_name=self._current_pdf.name,
+                lang_in=task.lang_in,
+                lang_out=task.lang_out,
+                translator=task.translator,
+                output_mode=task.output_mode,
+                timestamp=time.time(),
+            )
+            write_source_info(sidecar_path(self._output_dir, base), info)
+        except Exception:
+            logger.exception("Failed to record translation source info")
+
     def _on_progress(self, event: TranslationEvent) -> None:
         self._progress.setMaximum(event.total)
         self._progress.setValue(event.current)
@@ -178,6 +244,9 @@ class _TranslationFlowMixin:
 
         self._dual_path = event.dual_pdf_path
         self._mono_path = event.mono_pdf_path
+
+        # 记录「源文件指纹 → 结果」映射，供后续重复提交复用检测
+        self._record_translation(event)
 
         # 根据用户选择决定展示哪个
         task = self._settings.build_task(str(self._current_pdf))

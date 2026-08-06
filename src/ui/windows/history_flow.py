@@ -16,6 +16,37 @@ from PySide6.QtWidgets import QMessageBox
 class _HistoryFlowMixin:
     """历史记录选择与双栏/单栏切换。"""
 
+    def _apply_history_result(self, entry) -> bool:
+        """加载一条已有翻译结果（复用检测 / 历史回放），按当前输出模式展示。
+
+        与 _on_finished 的展示逻辑一致。成功返回 True；结果文件缺失返回 False。
+        """
+        dual = entry.dual_pdf
+        mono = entry.mono_pdf
+        self._dual_path = dual
+        self._mono_path = mono
+
+        mode = "dual"
+        if getattr(self, "_current_pdf", None):
+            try:
+                mode = self._settings.build_task(str(self._current_pdf)).output_mode
+            except Exception:
+                mode = "dual"
+
+        target = mono if mode == "mono" else (dual or mono)
+        if target and target.exists():
+            self._viewer.load_pdf(str(target))
+            self._setup_minimap()
+            self._tab_bar.setCurrentIndex(1)
+            self._tab_bar.setTabEnabled(1, True)
+            self._download_btn.setEnabled(True)
+            self._update_zoom_label()
+            self._settings.set_status(f"已复用翻译结果：{entry.display_name}")
+            return True
+
+        QMessageBox.warning(self, "结果缺失", "已有翻译结果文件缺失，无法复用。")
+        return False
+
     def _on_history_selected(self, dual_path: str, mono_path: str, name: str) -> None:
         """点击历史记录中的翻译"""
         target = dual_path or mono_path

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.core.translation.records import SIDECAR_SUFFIX, read_source_info
 from src.ui.base.icon_factory import accent_icon
 from src.ui.base.theme import Colors
 
@@ -37,6 +38,9 @@ class HistoryEntry:
     dual_pdf: Path | None      # 双语对照
     csv_path: Path | None      # 词汇表
     timestamp: float            # 文件修改时间
+    source_hash: str = ""       # 源文件内容指纹（sidecar 提供；空=旧记录）
+    source_bytes_hash: str = ""  # 源文件字节指纹（sidecar 提供）
+    source_name: str = ""       # 原始源文件名（sidecar 提供）
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -172,9 +176,53 @@ class HistoryPanel(QWidget):
                 entries[base].csv_path = f
                 entries[base].timestamp = max(entries[base].timestamp, f.stat().st_mtime)
 
+            elif name.endswith(SIDECAR_SUFFIX):
+                # 源文件指纹 sidecar：提供源文件内容/字节指纹（用于重复提交复用检测）
+                base = name[:-len(SIDECAR_SUFFIX)]
+                display = _clean_name(base)
+                if base not in entries:
+                    entries[base] = HistoryEntry(
+                        display_name=display,
+                        pdf_path=None,
+                        mono_pdf=None, dual_pdf=None, csv_path=None,
+                        timestamp=f.stat().st_mtime,
+                    )
+                info = read_source_info(f)
+                if info:
+                    entries[base].source_hash = info.source_hash
+                    entries[base].source_bytes_hash = info.source_bytes_hash
+                    entries[base].source_name = info.source_name
+                    if info.timestamp:
+                        entries[base].timestamp = max(entries[base].timestamp, info.timestamp)
+
         # 按时间降序排列
         result = sorted(entries.values(), key=lambda e: e.timestamp, reverse=True)
         return result
+
+    def find_by_hash(self, source_hash: str, source_bytes_hash: str = "") -> HistoryEntry | None:
+        """按源文件指纹查找已有翻译记录（优先 mono+dual 齐全的）。
+
+        内容指纹或字节指纹任一命中即可；两者都为空时返回 None。
+        """
+        if not source_hash and not source_bytes_hash:
+            return None
+
+        def _matches(e: HistoryEntry) -> bool:
+            if source_bytes_hash and e.source_bytes_hash == source_bytes_hash:
+                return True
+            if source_hash and e.source_hash == source_hash:
+                return True
+            return False
+
+        fallback: HistoryEntry | None = None
+        for e in self._entries:
+            if not _matches(e):
+                continue
+            if e.dual_pdf and e.mono_pdf:
+                return e
+            if fallback is None:
+                fallback = e
+        return fallback
 
     def _rebuild_list(self) -> None:
         self._list.clear()

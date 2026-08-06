@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import QEvent, Qt, QSettings, QVariantAnimation
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -35,8 +36,10 @@ from PySide6.QtWidgets import (
 
 from src.core.signals import TranslationSignals
 from src.core.translation.engine import TranslationEngine
+from src.core.translation.records import compute_source_fingerprint
 from src.ui.base.icon_factory import IconHoverFilter, accent_icon
 from src.ui.base.theme import ThemePalette, theme_manager, _contrast_text
+from src.ui.dialogs.quick_translate import QuickTranslateDialog
 from src.ui.panels.settings import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
 from src.ui.pdf.viewer import PDFViewer
 from src.ui.windows.history_flow import _HistoryFlowMixin
@@ -139,6 +142,11 @@ class MainWindow(
         self._current_pdf: Path | None = None
         self._mono_path: Path | None = None
         self._dual_path: Path | None = None
+        # 源文件指纹（重复提交复用检测；_load_pdf 时计算）
+        self._current_pdf_hash: str | None = None
+        self._current_pdf_bytes_hash: str | None = None
+        # viewer 高度缓存（minimap 跟随重定位时避免重复重算面板）
+        self._last_viewer_h: int | None = None
         self._sidebar_visible = True
         self._sidebar_anim: QVariantAnimation | None = None
 
@@ -200,6 +208,8 @@ class MainWindow(
         self._viewer = PDFViewer()
         self._viewer.text_selected.connect(self._on_text_selected)
         self._viewer.translate_requested.connect(self._on_viewer_translate_requested)
+        # 监听 viewer 尺寸变化（侧边栏动画/窗口缩放），实时跟随重定位 minimap
+        self._viewer.installEventFilter(self)
         main_layout.addWidget(self._viewer, stretch=1)
 
         # 缩略图导航（覆盖在 PDF 查看器右上角）
@@ -460,8 +470,9 @@ class MainWindow(
 
     def _on_toggle_theme(self) -> None:
         app = QApplication.instance()
-        if hasattr(app, "toggle_theme"):
-            app.toggle_theme()
+        toggle = getattr(app, "toggle_theme", None)
+        if toggle is not None:
+            toggle()
             self._refresh_theme()
 
     def _refresh_theme(self) -> None:
@@ -538,6 +549,25 @@ class MainWindow(
         self._mono_path = None
         self._dual_path = None
 
+        # ── 计算源文件指纹（内容+字节），用于「已翻译过则复用」检测 ──
+        # 论文 PDF 通常很小，同步计算可接受；失败则跳过复用检测。
+        self._current_pdf_hash = None
+        self._current_pdf_bytes_hash = None
+        try:
+            self._current_pdf_hash, self._current_pdf_bytes_hash = compute_source_fingerprint(pdf_path)
+        except Exception:
+            logger.debug("Failed to fingerprint source pdf", exc_info=True)
+
+        # 若该文件已翻译过，给出可复用提示（真正复用发生在点击「翻译」时）
+        if self._current_pdf_hash or self._current_pdf_bytes_hash:
+            reuse = self._history.find_by_hash(
+                self._current_pdf_hash or "", self._current_pdf_bytes_hash or ""
+            )
+            if reuse is not None:
+                self._settings.set_status(
+                    f"已找到该文件的翻译记录（{reuse.display_name}），点击「翻译」可直接复用"
+                )
+
         self._viewer.clear()
         try:
             self._viewer.load_pdf(str(pdf_path))
@@ -590,6 +620,34 @@ class MainWindow(
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._minimap.isVisible():
+        if self._minimap and self._minimap.isVisible():
             self._position_minimap()
+
+    # ═══════════════════════════════════════════════════════════
+    # 事件过滤器（viewer 尺寸变化 → minimap 跟随）
+    # ═══════════════════════════════════════════════════════════
+
+    def eventFilter(self, watched, event) -> bool:
+        """监听 viewer 的 Resize，实时重定位 minimap。
+
+        侧边栏收起/展开动画期间，viewer 宽度逐帧变化（其左上角也随布局左移），
+        仅靠动画结束后的单次定位会读到未生效的宽度、导致 minimap 位置偏移；
+        改为在每次 viewer resize 时即时跟随，保证动画全程贴住右上角。
+        """
+        if watched is self._viewer and event.type() == QEvent.Type.Resize:
+            self._on_viewer_resized()
+        return super().eventFilter(watched, event)
+
+    def _on_viewer_resized(self) -> None:
+        """viewer 尺寸变化时重定位 minimap（高度变化才重算面板几何）。"""
+        if self._minimap is None or not self._minimap.isVisible():
+            return
+        h = self._viewer.height()
+        if self._last_viewer_h != h:
+            self._last_viewer_h = h
+            self._minimap.refresh_geometry()  # 面板高度随 viewer 高度封顶
+        x = self._viewer.width() - self._minimap.width() - 8
+        y = 8
+        self._minimap.move(x, y)
+        self._minimap.raise_()
 
