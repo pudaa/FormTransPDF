@@ -14,6 +14,7 @@ PDF 页面渲染与查看组件 — 基于 QPdfView (PySide6 QtPdf)
 
 from __future__ import annotations
 
+import shiboken6
 from PySide6.QtCore import Qt, QPoint, QEvent, QMargins, QRectF, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QMouseEvent, QPalette, QWheelEvent, QScreen,
@@ -179,9 +180,19 @@ class PDFViewerCore(QWidget):
     def document(self) -> QPdfDocument | None:
         return self._doc
 
+    def _doc_is_valid(self) -> bool:
+        """文档存在且底层 C++ 对象未被销毁。
+
+        窗口关闭/组件销毁过程中 QPdfView 可能已删除 QPdfDocument，
+        Python 侧 self._doc 仍非 None，但访问会抛
+        RuntimeError: Internal C++ object already deleted。
+        """
+        return self._doc is not None and shiboken6.isValid(self._doc)
+
     @property
     def page_count(self) -> int:
-        return self._doc.pageCount() if self._doc else 0
+        doc = self._doc
+        return doc.pageCount() if doc is not None and shiboken6.isValid(doc) else 0
 
     @property
     def scale(self) -> float:
@@ -255,6 +266,58 @@ class PDFViewerCore(QWidget):
         self._doc = None
         self._stack.setCurrentIndex(0)
 
+    def shutdown(self) -> None:
+        """窗口关闭前调用：断开视口跟踪信号、取消后台任务、卸载文档。
+
+        防止窗口销毁过程中 QPdfView 触发 resize/滚动/缩放等信号时，
+        _on_viewport_changed 访问到已被 Qt 删除的 QPdfDocument，
+        抛出 RuntimeError: Internal C++ object already deleted。
+        """
+        self._disconnect_viewport_tracking()
+        self._doc_id += 1
+        self._text_extractor.cancel()
+        self._text_spans.clear()
+        try:
+            if shiboken6.isValid(self._pdf_view):
+                self._pdf_view.setDocument(None)
+        except RuntimeError:
+            pass
+        self._doc = None
+        self._layout_engine.set_document(None)
+        if shiboken6.isValid(self._text_overlay):
+            self._text_overlay.clear_highlights()
+            self._text_overlay.hide()
+
+    def _disconnect_viewport_tracking(self) -> None:
+        """断开 _connect_viewport_tracking() 建立的所有信号连接。"""
+        if not shiboken6.isValid(self._pdf_view):
+            return
+        for getter in (self._pdf_view.verticalScrollBar, self._pdf_view.horizontalScrollBar):
+            try:
+                bar = getter()
+                if shiboken6.isValid(bar):
+                    bar.valueChanged.disconnect(self._on_viewport_changed)
+            except (RuntimeError, TypeError):
+                pass
+        for sig in (
+            self._pdf_view.zoomFactorChanged,
+            self._pdf_view.pageSpacingChanged,
+            self._pdf_view.documentMarginsChanged,
+            self._pdf_view.pageModeChanged,
+        ):
+            try:
+                sig.disconnect(self._on_viewport_changed)
+            except (RuntimeError, TypeError):
+                pass
+        # 移除事件过滤器，避免销毁期间 viewport Resize 等事件仍被处理
+        try:
+            self._pdf_view.removeEventFilter(self)
+            vp = self._pdf_view.viewport()
+            if shiboken6.isValid(vp):
+                vp.removeEventFilter(self)
+        except RuntimeError:
+            pass
+
     def _exit_fit_width(self) -> float:
         """从 FitToWidth 切换到 Custom 模式，返回视觉缩放比（物理像素/点）。
 
@@ -319,17 +382,21 @@ class PDFViewerCore(QWidget):
         - FitToWidth: res * (vp_w - 边距) / qRound(pt_w * res)
         - Custom:     res * zoomFactor() == self._scale
         """
-        if not self._doc or self._doc.pageCount() == 0:
+        if not self._doc_is_valid():
             return self._scale
         vp = self._pdf_view.viewport()
+        if vp is None or not shiboken6.isValid(vp):
+            return self._scale
         return self._layout_engine.current_scale(vp.width(), vp.height())
 
     def _on_viewport_changed(self):
         """滚动、缩放、resize 时调用，实时更新文本层坐标"""
-        if not self._doc:
+        if not self._doc_is_valid() or not shiboken6.isValid(self._pdf_view):
             return
 
         vp = self._pdf_view.viewport()
+        if vp is None or not shiboken6.isValid(vp):
+            return
         layouts = self._layout_engine.compute_layout(vp.width(), vp.height())
 
         # ── 诊断：对比引擎计算的 content 尺寸与 QPdfView 实际 scrollbar ──
@@ -397,7 +464,7 @@ class PDFViewerCore(QWidget):
 
     def _on_text_page_ready(self, page_num: int, spans: list, doc_id: int):
         """后台线程返回单页文本"""
-        if doc_id != self._doc_id or not self._doc:
+        if doc_id != self._doc_id or not self._doc_is_valid():
             return  # 丢弃过期结果
 
         self._text_spans[page_num] = spans

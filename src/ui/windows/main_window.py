@@ -2,7 +2,7 @@
 主窗口 — "Gilded Ink / Vellum" 双主题布局
 
 ┌──────────────────────────────────────────────────────────┐
-│ ☰  FormTransPDF       [−] 适应 [+] │ 暗色主题 │ 下载译文      │
+│ ☰  FormTransPDF  [−] 适应 [+] ... 下载译文  [─][□][✕]   │ ← 标题栏
 ├────────┬─────────────────────────────────────────────────┤
 │ 可收起 │  [文档标签页 ...]          [原文] [译文]          │
 │ 侧边栏 │  ┌──────────────────────────────────────────┐   │
@@ -46,6 +46,7 @@ from src.ui.windows.history_flow import _HistoryFlowMixin
 from src.ui.windows.minimap_controller import _MinimapControllerMixin
 from src.ui.windows.sidebar_behavior import _SidebarBehaviorMixin
 from src.ui.windows.translation_flow import _EngineLoader, _TranslationFlowMixin
+from src.ui.windows.window_chrome import _WindowChromeMixin, TitleBar
 from src.ui.widgets.document_tab_bar import DocumentTab, DocumentTabBar, _adjust_index
 from src.ui.widgets.drop_zone import DropZone
 from src.ui.widgets.history_panel import HistoryPanel
@@ -106,6 +107,7 @@ class MainWindow(
     _HistoryFlowMixin,
     _MinimapControllerMixin,
     _SidebarBehaviorMixin,
+    _WindowChromeMixin,
     QMainWindow,
 ):
     """FormTransPDF 主窗口
@@ -115,6 +117,7 @@ class MainWindow(
     - _TranslationFlowMixin   翻译编排 / 即时翻译弹窗
     - _HistoryFlowMixin       历史记录回放
     - _MinimapControllerMixin 缩略图导航
+    - _WindowChromeMixin      无边框窗口装饰（标题栏/缩放/圆角）
     """
 
     SIDEBAR_WIDTH = 280
@@ -159,10 +162,22 @@ class MainWindow(
         self._theme_icon_filter: IconHoverFilter | None = None
 
         self._build_ui()
+        self._setup_window_chrome()
         self._connect_signals()
         self._history.refresh()  # 启动时扫描已有记录
         self.setAcceptDrops(True)
         self._start_engine_load()
+
+    def closeEvent(self, event) -> None:
+        """窗口关闭前清理：断开 PDF 查看器的视口跟踪信号并卸载文档。
+
+        避免窗口销毁过程中 QPdfView 触发 resize/滚动等信号时，
+        _on_viewport_changed 访问到已被 Qt 删除的 QPdfDocument，
+        抛出 RuntimeError: Internal C++ object already deleted。
+        """
+        if hasattr(self, "_viewer"):
+            self._viewer.shutdown()
+        super().closeEvent(event)
 
     # ═══════════════════════════════════════════════════════════
     # UI 构建
@@ -243,26 +258,33 @@ class MainWindow(
         self.setCentralWidget(central)
         central.setStyleSheet(f"background-color: {tp.canvas.name()};")
 
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # ── 标题栏（全宽，兼作工具栏：品牌/操作 + 窗口控制）──
+        self._toolbar = self._build_toolbar()
+        root.addWidget(self._toolbar)
+
+        # ── 内容行：侧边栏 + 主区域（内部布局不变）──────────
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
         self._sidebar = self._build_sidebar()
-        root.addWidget(self._sidebar)
+        content_layout.addWidget(self._sidebar)
 
         self._sidebar_sep = QFrame()
         self._sidebar_sep.setFrameShape(QFrame.Shape.VLine)
         self._sidebar_sep.setMinimumWidth(0)  # 允许动画收缩到 0
         self._sidebar_sep.setStyleSheet(f"color: {tp.divider.name()};")
-        root.addWidget(self._sidebar_sep)
+        content_layout.addWidget(self._sidebar_sep)
 
         main_area = QWidget()
         main_layout = QVBoxLayout(main_area)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-
-        self._toolbar = self._build_toolbar()
-        main_layout.addWidget(self._toolbar)
 
         self._tab_row = self._build_tab_row()
         main_layout.addWidget(self._tab_row)
@@ -278,7 +300,9 @@ class MainWindow(
         self._minimap = MinimapPanel(self._viewer) # 缩略图导航
         self._minimap.page_clicked.connect(self._on_minimap_page_clicked)
         self._minimap.viewport_dragged.connect(self._on_minimap_dragged)
-        root.addWidget(main_area, stretch=1) # 主内容区域
+        content_layout.addWidget(main_area, stretch=1) # 主内容区域
+
+        root.addWidget(content, stretch=1)
 
     # ── 侧边栏 ───────────────────────────────────────────────
 
@@ -329,7 +353,7 @@ class MainWindow(
 
     def _build_toolbar(self) -> QWidget:
         tp = self._tp
-        bar = QWidget()
+        bar = TitleBar(self)  # 标题栏：支持拖拽移动 / 双击最大化还原
         bar.setFixedHeight(40)
         self._toolbar_widget = bar  # for theme refresh
 
@@ -417,6 +441,9 @@ class MainWindow(
         self._download_btn.clicked.connect(self._on_download)
         layout.addWidget(self._download_btn)
 
+        # 窗口控制按钮（最小化 / 最大化·还原 / 关闭）
+        layout.addWidget(self._build_window_controls())
+
         self._apply_toolbar_styles()
         return bar
 
@@ -490,6 +517,10 @@ class MainWindow(
         self._zoom_label.setStyleSheet(
             f"color: {tp.text_secondary.name()}; font-size: 10pt; background: transparent;"
         )
+
+        # 窗口控制按钮（SVG 图标 / hover 背景）随主题刷新
+        if hasattr(self, "_win_controls"):
+            self._win_controls.refresh_theme()
 
     # ── 标签行（文档标签页 + 原文/译文切换，单行合并）────────
 
@@ -846,12 +877,19 @@ class MainWindow(
     # ═══════════════════════════════════════════════════════════
 
     def eventFilter(self, watched, event) -> bool:
-        """监听 viewer 的 Resize，实时重定位 minimap。
+        """窗口事件分发：无边框边缘缩放 + viewer 尺寸变化 → minimap 跟随。
 
-        侧边栏收起/展开动画期间，viewer 宽度逐帧变化（其左上角也随布局左移），
-        仅靠动画结束后的单次定位会读到未生效的宽度、导致 minimap 位置偏移；
-        改为在每次 viewer resize 时即时跟随，保证动画全程贴住右上角。
+        边缘缩放：无边框窗口没有原生缩放边框，通过应用级事件过滤器在
+        窗口边缘检测鼠标按下/拖动实现跨平台缩放。
         """
+        # 无边框窗口边缘缩放（跨平台）；防御性捕获——应用级过滤器会收到
+        # 各类事件（含 QWindow 等原生对象），单个异常不得拖垮整个应用
+        try:
+            if self._chrome_handle_event(watched, event):
+                return True
+        except Exception:
+            logger.debug("Window chrome event error", exc_info=True)
+        # 监听 viewer 的 Resize，实时重定位 minimap（侧边栏动画期间 viewer 逐帧变宽）
         if watched is self._viewer and event.type() == QEvent.Type.Resize:
             self._on_viewer_resized()
         return super().eventFilter(watched, event)

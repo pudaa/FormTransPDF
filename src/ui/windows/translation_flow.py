@@ -112,6 +112,7 @@ class _TranslationFlowMixin:
                 return
 
         self._settings.set_translating(True)
+        self._settings.setStyleSheet(f"background: transparent;")
         self._progress.setVisible(True)
         self._progress.setValue(0)
         asyncio.ensure_future(self._run_translate(task))

@@ -25,6 +25,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional
 
+import shiboken6
 from PySide6.QtCore import QRectF, QMargins
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtPdf import QPdfDocument
@@ -65,6 +66,19 @@ class PdfLayoutEngine:
     def set_document(self, doc: Optional[QPdfDocument]):
         self._doc = doc
 
+    def _is_ready(self) -> bool:
+        """文档与视图的 C++ 对象均存活且文档非空。
+
+        窗口关闭/组件销毁过程中，QPdfDocument / QPdfView 的 C++ 对象
+        可能已被 Qt 删除，直接访问会抛
+        RuntimeError: Internal C++ object already deleted。
+        """
+        if self._doc is None or not shiboken6.isValid(self._doc):
+            return False
+        if not shiboken6.isValid(self._pdf_view):
+            return False
+        return self._doc.pageCount() > 0
+
     # ── 公共 API ──────────────────────────────────────────
 
     def compute_layout(self, viewport_width: int, viewport_height: int) -> List[PageLayout]:
@@ -75,7 +89,7 @@ class PdfLayoutEngine:
         - x 基于 (max(文档总宽, 视口宽)) 居中
         - y 从 margins.top() 起，每页累加 页高 + pageSpacing
         """
-        if not self._doc or self._doc.pageCount() == 0:
+        if not self._is_ready():
             return []
 
         margins = self._pdf_view.documentMargins()
@@ -125,7 +139,7 @@ class PdfLayoutEngine:
         - Custom: res * zoomFactor
         - FitToWidth / FitInView: res * pageScale
         """
-        if not self._doc or self._doc.pageCount() == 0:
+        if not self._is_ready():
             return 1.0
 
         margins = self._pdf_view.documentMargins()
