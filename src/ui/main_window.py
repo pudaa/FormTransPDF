@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from src.core.signals import TranslationEvent, TranslationTask, TranslationSignals
 from src.core.translator import EngineNotReadyError, TranslationEngine
+from src.ui.pdf.cover import COVER_TRANSLATED, COVER_TRANSPARENT
 from src.ui.quick_translate_dialog import QuickTranslateDialog
 from src.ui.pdf_viewer import PDFViewer
 from src.ui.settings_panel import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
@@ -134,7 +135,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("FormTransPDF — PDF 科学论文翻译")
+        self.setWindowTitle("FormTransPDF — PDF 论文翻译")
         self.setMinimumSize(self.MIN_WINDOW_W, self.MIN_WINDOW_H)
         self.resize(self.DEFAULT_W, self.DEFAULT_H)
 
@@ -243,7 +244,7 @@ class MainWindow(QMainWindow):
         brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(brand)
 
-        sub = QLabel("科学论文翻译工坊")
+        sub = QLabel("论文翻译查看器")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"color: {tp.text_secondary.name()}; font-size: 9pt; font-style: italic; padding-bottom: 4px; background: transparent;")
         layout.addWidget(sub)
@@ -325,6 +326,24 @@ class MainWindow(QMainWindow):
         self._translate_quick_btn, _ = self._make_tool_icon_btn("translate", "即时翻译选中文本", width=38)
         self._translate_quick_btn.clicked.connect(self._open_quick_translate)
         layout.addWidget(self._translate_quick_btn)
+
+        # 粗糙翻译：启动 + 原文/译文切换（基于文本层的快速整篇翻译）
+        self._rough_start_btn = QPushButton(" 粗糙翻译")
+        self._rough_start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rough_start_btn.setEnabled(False)
+        self._rough_start_btn.setToolTip(
+            "基于文本层快速翻译整篇文档（不保存，译文覆盖显示在原文上方）"
+        )
+        self._rough_start_btn.clicked.connect(self._on_start_rough)
+        layout.addWidget(self._rough_start_btn)
+
+        self._rough_toggle_btn = QPushButton(" 原文")
+        self._rough_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rough_toggle_btn.setCheckable(True)
+        self._rough_toggle_btn.setEnabled(False)
+        self._rough_toggle_btn.setToolTip("切换原文 / 译文（仅重绘文本层，无需重载文档）")
+        self._rough_toggle_btn.toggled.connect(self._on_toggle_rough_mode)
+        layout.addWidget(self._rough_toggle_btn)
 
         # 划词自动弹出即时翻译开关（Switch 组件；关闭后划词仅高亮不弹窗）
         self._auto_translate_switch = Switch()
@@ -427,6 +446,21 @@ class MainWindow(QMainWindow):
             f"border-color: {tp.text_disabled.name()}; }}"
         )
         self._download_btn.setStyleSheet(dl_style)
+
+        # 粗糙翻译按钮样式（checkable 高亮译文态）
+        rough_style = (
+            f"QPushButton {{ background-color: {tp.surface.name()};"
+            f"color: {tp.accent.name()};"
+            f"border: 1px solid {tp.divider.name()}; border-radius: 4px;"
+            f"padding: 4px 10px; font-size: 10pt; font-weight: 500; }}"
+            f"QPushButton:hover {{ background-color: {tp.accent_muted.name()}; }}"
+            f"QPushButton:checked {{ background-color: {tp.accent.name()};"
+            f"color: {_contrast_text(tp.accent).name()}; border-color: {tp.accent.name()}; }}"
+            f"QPushButton:disabled {{ background-color: transparent;"
+            f"color: {tp.text_disabled.name()}; border-color: {tp.text_disabled.name()}; }}"
+        )
+        self._rough_start_btn.setStyleSheet(rough_style)
+        self._rough_toggle_btn.setStyleSheet(rough_style)
 
         self._zoom_label.setStyleSheet(
             f"color: {tp.text_secondary.name()}; font-size: 10pt; background: transparent;"
@@ -598,6 +632,13 @@ class MainWindow(QMainWindow):
         self._settings._output_mode_combo.currentIndexChanged.connect(
             self._on_output_mode_changed
         )
+        # 粗糙翻译状态同步
+        self._viewer.rough_status.connect(self._on_rough_status)
+        self._viewer.rough_ready.connect(self._on_rough_ready)
+        self._viewer.text_layer_ready.connect(self._on_text_layer_ready)
+        # 侧边栏粗糙翻译按钮（与顶栏按钮等效，位置更显眼）
+        self._settings.rough_btn.clicked.connect(self._on_start_rough)
+        self._settings.rough_toggle_btn.toggled.connect(self._on_toggle_rough_mode)
 
     # ═══════════════════════════════════════════════════════════
     # PDF 加载
@@ -635,6 +676,7 @@ class MainWindow(QMainWindow):
         self._download_btn.setEnabled(False)
         self._settings.set_pdf_loaded(path, loaded=True)
         self._update_zoom_label()
+        self._sync_rough_ui()
 
     # ═══════════════════════════════════════════════════════════
     # 标签切换
@@ -650,6 +692,7 @@ class MainWindow(QMainWindow):
                 self._viewer.load_pdf(str(target))
                 self._setup_minimap()
         self._update_zoom_label()
+        self._sync_rough_ui()
 
     # ═══════════════════════════════════════════════════════════
     # 翻译
@@ -774,6 +817,85 @@ class MainWindow(QMainWindow):
             self._quick_translate_dialog.set_profile(self._settings.translation_profile())
             self._quick_translate_dialog.set_source_text(text, auto_translate=True)
 
+    # ── 粗糙翻译 ───────────────────────────────────────────
+
+    def _on_start_rough(self) -> None:
+        """启动粗糙翻译（复用即时翻译配置，基于原文文本层）。"""
+        print(
+            "[rough] click: pdf=%s doc=%s layer_done=%s seg=%d tab=%d" % (
+                self._current_pdf is not None,
+                self._viewer.document is not None,
+                self._viewer.text_layer_done,
+                self._viewer.rough_segment_count(),
+                self._tab_bar.currentIndex(),
+            )
+        )
+        if not self._current_pdf:
+            QMessageBox.information(self, "提示", "请先加载 PDF 文件")
+            return
+        # 文本层尚未提取完成（大文档可能需要几秒）——给出明确提示而非静默失败
+        if not self._viewer.text_layer_done:
+            self._settings.set_status("文本层提取中，请稍候再点「粗糙翻译」…")
+            return
+        # (b) 防护：粗糙翻译永远基于「原文」文本层 —— 若正在查看翻译结果，自动切回原文
+        if self._tab_bar.currentIndex() != 0:
+            self._tab_bar.setCurrentIndex(0)
+            self._settings.set_status("粗糙翻译基于原文执行 — 已切换回原文视图")
+        profile = self._settings.translation_profile()
+        ok = self._viewer.start_rough_translation(
+            profile,
+            str(profile.get("lang_in") or "en"),
+            str(profile.get("lang_out") or "zh"),
+        )
+        if not ok:
+            self._settings.set_status(
+                "没有可翻译的文本层（文档可能为扫描件）", is_error=True
+            )
+            return
+        self._sync_rough_ui()
+
+    def _on_toggle_rough_mode(self, checked: bool) -> None:
+        """原文/译文切换（文本层渲染模式切换，不重载文档）。"""
+        self._viewer.set_cover_mode(COVER_TRANSLATED if checked else COVER_TRANSPARENT)
+        for btn in (self._rough_toggle_btn, self._settings.rough_toggle_btn):
+            if btn.isChecked() != checked:
+                btn.blockSignals(True)
+                btn.setChecked(checked)
+                btn.blockSignals(False)
+            btn.setText("译文" if checked else "原文")
+
+    def _on_rough_status(self, message: str) -> None:
+        self._settings.set_status(message)
+
+    def _on_rough_ready(self) -> None:
+        self._sync_rough_ui()
+
+    def _on_text_layer_ready(self) -> None:
+        """文本层提取完成：同步按钮态并提示。"""
+        self._sync_rough_ui()
+        self._settings.set_status("文本层就绪 — 可以开始粗糙翻译")
+
+    def _sync_rough_ui(self) -> None:
+        """按 viewer 当前状态同步粗糙翻译按钮（顶栏 + 侧边栏）。"""
+        try:
+            viewer = self._viewer
+            has_doc = self._current_pdf is not None or viewer.document is not None
+            has_layer = viewer.has_rough_segments()
+            translated = viewer.cover_mode == COVER_TRANSLATED
+
+            self._rough_start_btn.setEnabled(has_doc)
+            self._settings.rough_btn.setEnabled(has_doc)
+            for btn in (self._rough_toggle_btn, self._settings.rough_toggle_btn):
+                btn.setEnabled(has_layer)
+                if btn.isChecked() != translated:
+                    btn.blockSignals(True)
+                    btn.setChecked(translated)
+                    btn.blockSignals(False)
+                btn.setText("译文" if translated else "原文")
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
     def _on_finished(self, event: TranslationEvent) -> None:
         self._progress.setValue(self._progress.maximum())
         self._settings.set_status(f"翻译完成 — 耗时 {event.elapsed_seconds:.1f}s")
@@ -839,6 +961,7 @@ class MainWindow(QMainWindow):
         self._download_btn.setEnabled(bool(target))
         self._settings.set_pdf_loaded(name, loaded=False)
         self._settings.set_status(f"历史: {name}")
+        self._sync_rough_ui()
 
     def _on_output_mode_changed(self) -> None:
         """输出模式下拉框变更时，若正在查看历史记录则切换双栏/单栏"""

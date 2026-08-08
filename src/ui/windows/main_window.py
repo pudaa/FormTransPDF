@@ -18,6 +18,10 @@ import sys
 import threading
 from pathlib import Path
 
+try:
+    from PySide6 import shiboken6  # pip 安装的 PySide6 通常在此
+except ImportError:  # conda 安装的 PySide6 把 shiboken6 作为顶层包
+    import shiboken6
 from PySide6.QtCore import QEvent, Qt, QSettings, QVariantAnimation
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
@@ -41,6 +45,7 @@ from src.ui.base.icon_factory import IconHoverFilter, accent_icon, svg_icon
 from src.ui.base.theme import ThemePalette, theme_manager, _contrast_text
 from src.ui.dialogs.quick_translate import QuickTranslateDialog
 from src.ui.panels.settings import SettingsPanel, SETTINGS_APP, SETTINGS_ORG
+from src.ui.pdf.cover import COVER_TRANSLATED, COVER_TRANSPARENT
 from src.ui.pdf.viewer import PDFViewer
 from src.ui.windows.history_flow import _HistoryFlowMixin
 from src.ui.windows.minimap_controller import _MinimapControllerMixin
@@ -128,7 +133,7 @@ class MainWindow(
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("FormTransPDF — PDF 科学论文翻译")
+        self.setWindowTitle("FormTransPDF — PDF 论文翻译")
         self.setMinimumSize(self.MIN_WINDOW_W, self.MIN_WINDOW_H)
         self.resize(self.DEFAULT_W, self.DEFAULT_H)
 
@@ -157,6 +162,8 @@ class MainWindow(
         self._engine_worker: _EngineLoader | None = None
         self._minimap: MinimapPanel | None = None  # 在 _build_ui 中创建
         self._minimap_synced = False  # 滚动条信号是否已连接
+        # 跨 viewer 实例的文档会话共享池（布局 mono↔dual 重建时迁移，避免重新提取/翻译）
+        self._rough_sessions: dict[str, dict] = {}
         self._quick_translate_dialog: QuickTranslateDialog | None = None
         self._icon_hovers: list = []  # IconHoverFilter 列表（主题切换时刷新）
         self._theme_icon_filter: IconHoverFilter | None = None
@@ -186,6 +193,14 @@ class MainWindow(
     @property
     def _tp(self) -> ThemePalette:
         return theme_manager.palette
+
+    def _create_viewer(self):
+        """按「粗糙布局」配置创建查看器：双栏（DualRoughViewer）或单栏（PDFViewer）。"""
+        layout_mode = str(self._app_settings.value("rough_layout", "mono") or "mono")
+        if layout_mode == "dual":
+            from src.ui.pdf.dual_viewer import DualRoughViewer
+            return DualRoughViewer()
+        return PDFViewer()
 
     # ═══════════════════════════════════════════════════════════
     # 文档标签页状态（属性路由到活动标签，兼容既有代码读写）
@@ -289,20 +304,56 @@ class MainWindow(
         self._tab_row = self._build_tab_row()
         main_layout.addWidget(self._tab_row)
 
-        self._viewer = PDFViewer()
+        self._viewer = self._create_viewer()
         self._viewer.text_selected.connect(self._on_text_selected)
         self._viewer.translate_requested.connect(self._on_viewer_translate_requested)
         # 监听 viewer 尺寸变化（侧边栏动画/窗口缩放），实时跟随重定位 minimap
         self._viewer.installEventFilter(self)
         main_layout.addWidget(self._viewer, stretch=1)
+        self._main_layout = main_layout  # 供粗糙布局切换时重建 viewer
 
         # 缩略图导航（覆盖在 PDF 查看器右上角）
-        self._minimap = MinimapPanel(self._viewer) # 缩略图导航
-        self._minimap.page_clicked.connect(self._on_minimap_page_clicked)
-        self._minimap.viewport_dragged.connect(self._on_minimap_dragged)
+        self._create_minimap()
         content_layout.addWidget(main_area, stretch=1) # 主内容区域
 
         root.addWidget(content, stretch=1)
+
+    def _create_minimap(self) -> None:
+        """为当前 viewer 创建缩略图导航面板（viewer 重建后必须重新创建）。"""
+        self._minimap = MinimapPanel(self._viewer)  # 缩略图导航
+        self._minimap.page_clicked.connect(self._on_minimap_page_clicked)
+        self._minimap.viewport_dragged.connect(self._on_minimap_dragged)
+
+    def _destroy_minimap(self) -> None:
+        """销毁当前 minimap（viewer 重建前调用，避免残留指向已删对象的引用）。"""
+        mm = self._minimap
+        was_synced = self._minimap_synced
+        self._minimap = None
+        self._minimap_synced = False
+        # 断开旧 viewer scrollbar 的视口同步连接：重建窗口期其 valueChanged
+        # 仍会触发 _update_minimap_viewport（minimap 已置 None → 已防御，但断开更干净）
+        if was_synced:
+            try:
+                if shiboken6.isValid(self._viewer):
+                    bar = self._viewer.verticalScrollBar()
+                    if shiboken6.isValid(bar):
+                        bar.valueChanged.disconnect(self._update_minimap_viewport)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
+        if mm is None or not shiboken6.isValid(mm):
+            return
+        try:
+            mm.page_clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            mm.viewport_dragged.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            mm.deleteLater()
+        except RuntimeError:
+            pass  # C++ 对象已随旧 viewer 销毁
 
     # ── 侧边栏 ───────────────────────────────────────────────
 
@@ -326,7 +377,7 @@ class MainWindow(
         brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(brand)
 
-        sub = QLabel("科学论文翻译工坊")
+        sub = QLabel("论文翻译查看器")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"color: {tp.text_secondary.name()}; font-size: 9pt; font-style: italic; padding-bottom: 4px; background: transparent;")
         layout.addWidget(sub)
@@ -548,6 +599,18 @@ class MainWindow(
         layout.addWidget(self._view_source_btn)
         layout.addWidget(self._view_result_btn)
 
+        # 粗糙翻译：单按钮三态（原文 → 点击=开始翻译/复用内存 → 译文；再点=原文）
+        self._rough_btn = QPushButton(" 粗糙翻译")
+        self._rough_btn.setFixedHeight(24)
+        self._rough_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rough_btn.setCheckable(True)
+        self._rough_btn.setEnabled(False)
+        self._rough_btn.setToolTip(
+            "粗糙翻译：点击切换到译文；再点切回原文"
+        )
+        self._rough_btn.toggled.connect(self._on_rough_toggled)
+        layout.addWidget(self._rough_btn)
+
         self._sync_view_toggle_ui()
         return row
 
@@ -599,6 +662,7 @@ class MainWindow(
         self._update_zoom_label()
         self._sync_view_toggle_ui()
         self._sync_download_btn()
+        self._sync_rough_ui()
 
     def _sync_view_toggle_ui(self) -> None:
         """刷新原文/译文按钮的可用性与选中态。"""
@@ -617,7 +681,9 @@ class MainWindow(
     def _sync_download_btn(self) -> None:
         tab = self._active_doc_tab()
         target = self._result_target(tab) if tab else None
-        self._download_btn.setEnabled(bool(target and target.exists()))
+        has_babel = bool(target and target.exists())
+        has_rough = bool(self._viewer.has_rough_translations())
+        self._download_btn.setEnabled(has_babel or has_rough)
 
     def _apply_tab_row_styles(self) -> None:
         tp = self._tp
@@ -629,6 +695,7 @@ class MainWindow(
         for btn, icon_name in (
             (self._view_source_btn, "document"),
             (self._view_result_btn, "web"),
+            (self._rough_btn, "translate"),
         ):
             if btn.isChecked():
                 icon_color = _contrast_text(tp.accent)
@@ -688,6 +755,7 @@ class MainWindow(
             loaded=tab.has_source,  # 历史结果标签（无源文件）不可翻译
         )
         self._settings.set_status(f"文档: {tab.title}")
+        self._sync_rough_ui()
 
     def _close_doc_tab(self, index: int) -> None:
         """关闭文档标签页；关闭最后一个后显示空状态。"""
@@ -725,6 +793,156 @@ class MainWindow(
         self._view_result_btn.setEnabled(False)
         self._settings.set_pdf_loaded("", loaded=False)
         self._settings.set_status("就绪 — 请载入 PDF")
+        self._sync_rough_ui()
+
+    # ═══════════════════════════════════════════════════════════
+    # 粗糙翻译（单按钮三态：原文 → 译文(开始/复用) → 原文）
+    # ═══════════════════════════════════════════════════════════
+
+    def _on_rough_toggled(self, checked: bool) -> None:
+        """粗糙翻译按钮切换。
+
+        - checked（切到译文）：首次点击 → 启动翻译；已有内存译文 → 直接复用呈现（不重译）；
+        - unchecked（切回原文）：仅切回透明层，翻译若在后台进行则继续累积。
+        """
+        viewer = self._viewer
+        tab = self._active_doc_tab()
+
+        if not checked:
+            viewer.set_cover_mode(COVER_TRANSPARENT)
+            self._sync_rough_ui()
+            return
+
+        if not tab or not (tab.has_source and tab.source_pdf):
+            self._settings.set_status("请先加载 PDF 文件", is_error=True)
+            self._rough_btn.setChecked(False)
+            return
+        if not viewer.text_layer_done:
+            self._settings.set_status("文本层提取中，请稍候再点「粗糙翻译」…")
+            self._rough_btn.setChecked(False)
+            return
+        # (b) 防护：粗糙翻译永远基于「原文」文本层 —— 若正在查看译文视图，先切回原文
+        if tab.view != "source":
+            self._set_active_view("source")
+            self._settings.set_status("粗糙翻译基于原文执行 — 已切换回原文视图")
+
+        if viewer.rough_is_running():
+            # 翻译仍在后台进行：直接呈现译文（不打断任务，未译段继续累积）
+            viewer.set_cover_mode(COVER_TRANSLATED)
+            self._settings.set_status("译文呈现中…（后台翻译仍在进行）")
+        else:
+            # 未在运行（含「翻译被布局切换暂停」的情况）：
+            # start_rough_translation 内部自动分派 ——
+            #   全部已译 → 复用内存译文（不重新翻译）；
+            #   部分已译 → 续传剩余未译段（暂停后点按钮即恢复翻译）；
+            #   无译文   → 全量启动。
+            profile = self._settings.translation_profile()
+            ok = viewer.start_rough_translation(
+                profile,
+                str(profile.get("lang_in") or "en"),
+                str(profile.get("lang_out") or "zh"),
+            )
+            if not ok:
+                self._settings.set_status(
+                    "没有可翻译的文本层（文档可能为扫描件）", is_error=True
+                )
+                self._rough_btn.setChecked(False)
+        self._sync_rough_ui()
+
+    def _on_rough_layout_changed(self) -> None:
+        """「粗糙布局」切换：持久化并重建 viewer（立即生效）。"""
+        mode = self._settings.rough_layout_combo.currentData()
+        self._app_settings.setValue("rough_layout", mode)
+        self._app_settings.sync()
+        self._rebuild_viewer()
+        self._settings.set_status(
+            f"粗糙翻译布局已切换为{'双栏对照' if mode == 'dual' else '单栏覆盖'}"
+        )
+
+    def _rebuild_viewer(self) -> None:
+        """用新布局的 viewer 替换当前 viewer（断开信号/卸载/重建/重载当前文档）。
+
+        minimap 是旧 viewer 的子对象，会随旧 viewer 一并销毁 —— 必须
+        先置空引用再重建，否则残留的 self._minimap 指向已删除的 C++ 对象，
+        resize/事件过滤路径访问它即抛 RuntimeError（全屏/布局切换崩溃根因）。
+        """
+        self._destroy_minimap()
+
+        old = self._viewer
+        # 迁移旧 viewer 的文档会话缓存到共享池（shutdown 会清空其内部缓存；
+        # 翻译结果随会话保留，新 viewer 复用后不再重新提取/翻译已完成段落）
+        try:
+            for k, v in old.export_sessions().items():
+                self._rough_sessions[k] = v
+        except Exception:
+            logger.debug("Failed to export sessions", exc_info=True)
+        for sig in (
+            old.text_selected,
+            old.translate_requested,
+            old.rough_status,
+            old.rough_ready,
+            old.text_layer_ready,
+        ):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        try:
+            old.removeEventFilter(self)
+        except Exception:
+            pass
+        old.shutdown()
+
+        self._viewer = self._create_viewer()
+        # 注入共享会话池：同一 PDF 的 doc/spans/segments/译文直接复用
+        self._viewer.inject_sessions(self._rough_sessions)
+        self._viewer.text_selected.connect(self._on_text_selected)
+        self._viewer.translate_requested.connect(self._on_viewer_translate_requested)
+        self._viewer.rough_status.connect(self._on_rough_status)
+        self._viewer.rough_ready.connect(self._on_rough_ready)
+        self._viewer.text_layer_ready.connect(self._on_text_layer_ready)
+        self._viewer.installEventFilter(self)
+        self._main_layout.replaceWidget(old, self._viewer)
+        old.deleteLater()
+
+        # 新 viewer 必须配套新 minimap（旧 minimap 已随旧 viewer 销毁）
+        self._create_minimap()
+
+        # 重载当前文档视图
+        tab = self._active_doc_tab()
+        if tab is not None:
+            self._apply_doc_view(tab)
+        else:
+            self._show_empty_state()
+
+    def _on_rough_status(self, message: str) -> None:
+        self._settings.set_status(message)
+
+    def _on_rough_ready(self) -> None:
+        self._sync_rough_ui()
+
+    def _on_text_layer_ready(self) -> None:
+        """文本层提取完成：同步按钮态并提示。"""
+        self._sync_rough_ui()
+        self._settings.set_status("文本层就绪 — 可以开始粗糙翻译")
+
+    def _sync_rough_ui(self) -> None:
+        """按 viewer 当前状态同步粗糙翻译按钮（标签行）。"""
+        try:
+            viewer = self._viewer
+            has_doc = self._current_pdf is not None or viewer.document is not None
+            has_layer = viewer.has_rough_segments()
+            translated = viewer.cover_mode == COVER_TRANSLATED
+
+            self._rough_btn.setEnabled(has_doc and has_layer)
+            if self._rough_btn.isChecked() != translated:
+                self._rough_btn.blockSignals(True)
+                self._rough_btn.setChecked(translated)
+                self._rough_btn.blockSignals(False)
+            self._rough_btn.setText("粗译译文" if translated else "粗译原文")
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
     # ═══════════════════════════════════════════════════════════
     # 主题切换
@@ -785,6 +1003,14 @@ class MainWindow(
         # 输出模式变更时（历史回放场景）切换双栏/单栏
         self._settings._output_mode_combo.currentIndexChanged.connect(
             self._on_output_mode_changed
+        )
+        # ── 粗糙翻译 ──
+        self._viewer.rough_status.connect(self._on_rough_status)
+        self._viewer.rough_ready.connect(self._on_rough_ready)
+        self._viewer.text_layer_ready.connect(self._on_text_layer_ready)
+        # 粗糙布局（单栏/双栏）变更 → 重建 viewer
+        self._settings.rough_layout_combo.currentIndexChanged.connect(
+            self._on_rough_layout_changed
         )
 
     # ═══════════════════════════════════════════════════════════

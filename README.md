@@ -11,7 +11,7 @@
 ![PySide6](https://img.shields.io/badge/PySide-6-41CD52?style=flat-square&logo=qt)
 ![License](https://img.shields.io/badge/License-MIT-8a8578?style=flat-square)
 
-**PDF 科学论文翻译查看器 — 基于 pdf2zh-next**
+**PDF 论文翻译查看器 — 基于 pdf2zh-next**
 
 "Darkroom for Documents" — 专注的阅读与翻译工坊
 

@@ -41,6 +41,7 @@ class HistoryEntry:
     source_hash: str = ""       # 源文件内容指纹（sidecar 提供；空=旧记录）
     source_bytes_hash: str = ""  # 源文件字节指纹（sidecar 提供）
     source_name: str = ""       # 原始源文件名（sidecar 提供）
+    source_path: str = ""       # 原文件绝对路径（sidecar 提供；历史打开原文用）
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -50,7 +51,7 @@ class HistoryEntry:
 class HistoryPanel(QWidget):
     """扫描 output/ 目录，以列表展示历史翻译记录"""
 
-    result_selected = Signal(str, str, str)  # dual_path, mono_path, display_name
+    result_selected = Signal(str, str, str, str)  # dual_path, mono_path, display_name, source_path
 
     def __init__(self, output_dir: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -192,6 +193,7 @@ class HistoryPanel(QWidget):
                     entries[base].source_hash = info.source_hash
                     entries[base].source_bytes_hash = info.source_bytes_hash
                     entries[base].source_name = info.source_name
+                    entries[base].source_path = info.source_path
                     if info.timestamp:
                         entries[base].timestamp = max(entries[base].timestamp, info.timestamp)
 
@@ -258,7 +260,7 @@ class HistoryPanel(QWidget):
         entry = self._entries[idx]
         dual = str(entry.dual_pdf) if entry.dual_pdf else ""
         mono = str(entry.mono_pdf) if entry.mono_pdf else ""
-        self.result_selected.emit(dual, mono, entry.display_name)
+        self.result_selected.emit(dual, mono, entry.display_name, entry.source_path)
 
 
 def _clean_name(base: str) -> str:

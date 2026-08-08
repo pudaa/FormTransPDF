@@ -9,6 +9,10 @@ Design: "Quiet Navigator" — 克制的琥珀/青铜指示器，柔光半透明�
 
 from __future__ import annotations
 
+try:
+    from PySide6 import shiboken6  # pip 安装的 PySide6 通常在此
+except ImportError:  # conda 安装的 PySide6 把 shiboken6 作为顶层包
+    import shiboken6
 from PySide6.QtCore import Qt, QRect, QEasingCurve, QPropertyAnimation, QSize, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
@@ -39,7 +43,7 @@ class MinimapPanel(QWidget):
         viewport_dragged(float): 拖拽视口指示器 → vertical ratio (0~1)
     """
 
-    THUMB_SCALE = 0.10
+    THUMB_SCALE = 0.16        # 生成缩略图的分辨率系数（0.10 → 0.16：窄版页面更宽，减少左右留白）
     PANEL_WIDTH = 100
     MIN_PAGE_HEIGHT = 6
     PAD = 5             # 内容上/下留白
@@ -101,7 +105,7 @@ class MinimapPanel(QWidget):
         """按面板宽度重算每页绘制尺寸/偏移与面板高度（槽位=绘制高度，无浪费）。"""
         if not self._thumbnails:
             return
-        thumb_w = self.width() - 14
+        thumb_w = self.width() - 8  # 左右内边距各 4px（原 7px，调小让缩略图更宽）
         pixmaps: list[QPixmap] = []
         offsets: list[int] = []
         cy = self.PAD
@@ -143,6 +147,9 @@ class MinimapPanel(QWidget):
 
     def toggle(self) -> None:
         """带动画的显示/隐藏切换"""
+        # 防御：minimap 可能随父 viewer 重建而销毁（布局切换场景）
+        if not self._effect_alive():
+            return
         # 停止正在进行的动画
         if self._fade_anim is not None and self._fade_anim.state() == QPropertyAnimation.State.Running:
             self._fade_anim.stop()
@@ -164,10 +171,24 @@ class MinimapPanel(QWidget):
         self._fade_anim.start()
 
     def isVisible(self) -> bool:
-        """重写：以 opacity 为准判断可见性"""
+        """重写：以 opacity 为准判断可见性。
+
+        注意：minimap 是 viewer 的子对象，布局切换（mono↔dual）重建 viewer 时
+        会随父对象一起销毁；此时本方法可能被 Qt 事件路径（resize/事件过滤）调用，
+        必须防御已删除的 C++ 对象，否则抛 RuntimeError 拖垮应用。
+        """
+        if not self._effect_alive():
+            return False
         return self._opacity_effect.opacity() > 0.01
 
     # ── 内部 ────────────────────────────────────────────────
+
+    def _effect_alive(self) -> bool:
+        """opacity effect 是否仍持有有效的 C++ 对象。"""
+        return (
+            self._opacity_effect is not None
+            and shiboken6.isValid(self._opacity_effect)
+        )
 
     @property
     def _tp(self) -> ThemePalette:

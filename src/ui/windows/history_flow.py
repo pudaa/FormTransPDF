@@ -39,8 +39,13 @@ class _HistoryFlowMixin:
         QMessageBox.warning(self, "结果缺失", "已有翻译结果文件缺失，无法复用。")
         return False
 
-    def _on_history_selected(self, dual_path: str, mono_path: str, name: str) -> None:
-        """点击历史记录中的翻译 → 以新文档标签页打开该翻译结果。"""
+    def _on_history_selected(self, dual_path: str, mono_path: str, name: str,
+                             source_path: str = "") -> None:
+        """点击历史记录中的翻译 → 以新文档标签页打开该翻译结果。
+
+        若 sidecar 记录了原文件路径且文件仍存在，则以原文件作为标签页的
+        source（「原文」视图可切回原文档）；否则退化为仅译文展示。
+        """
         target = dual_path or mono_path
         if not target:
             return
@@ -49,20 +54,24 @@ class _HistoryFlowMixin:
             QMessageBox.warning(self, "文件不存在", f"历史文件已失效:\n{path}")
             return
 
-        # 去重：该结果文件已作为标签打开则切换到已有标签页
+        # 去重：该结果文件已作为标签打开则切换到已有标签页（按译文结果比对）
         for i, tab in enumerate(self._doc_tabs):
-            if tab.source_pdf and tab.source_pdf.resolve() == path.resolve():
+            result_files = [p for p in (tab.dual_pdf, tab.mono_pdf) if p]
+            if any(p.resolve() == path.resolve() for p in result_files):
                 self._activate_doc_tab(i)
                 return
 
-        # 历史结果标签页：无真实源文件，仅展示译文
+        # 历史标签页：优先绑定原文件（可切原文），否则仅译文
+        src = Path(source_path) if source_path else None
+        if src is not None and not src.exists():
+            src = None
         tab = DocumentTab(
             title=name,
-            source_pdf=path,
+            source_pdf=src if src is not None else path,
             dual_pdf=Path(dual_path) if dual_path else None,
             mono_pdf=Path(mono_path) if mono_path else None,
             view="result",
-            has_source=False,
+            has_source=src is not None,
         )
         self._doc_tabs.append(tab)
         self._doc_tab_bar.add_tab(tab.title)
@@ -82,3 +91,4 @@ class _HistoryFlowMixin:
         elif mode == "dual" and self._dual_path.exists():
             self._viewer.load_pdf(str(self._dual_path))
             self._setup_minimap()
+        self._sync_rough_ui()

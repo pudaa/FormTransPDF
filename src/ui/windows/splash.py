@@ -46,7 +46,7 @@ class StartupSplash(QSplashScreen):
         sub_font = QFont("Microsoft YaHei", 11)
         painter.setFont(sub_font)
         painter.setPen(QColor("#8a8578"))
-        painter.drawText(20, 90, w - 40, 24, Qt.AlignmentFlag.AlignHCenter, "PDF 科学论文翻译工坊")
+        painter.drawText(20, 90, w - 40, 24, Qt.AlignmentFlag.AlignHCenter, "PDF 论文翻译查看器")
 
         # 加载提示
         hint_font = QFont("Microsoft YaHei", 9)

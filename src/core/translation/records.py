@@ -75,6 +75,7 @@ class SourceInfo:
     source_hash: str            # 内容指纹（主键）
     source_bytes_hash: str = ""  # 字节指纹（副键，扫描件兜底）
     source_name: str = ""
+    source_path: str = ""       # 原文件绝对路径（历史记录打开原文用；文件可能已移动）
     lang_in: str = "en"
     lang_out: str = "zh"
     translator: str = ""
@@ -95,6 +96,7 @@ def read_source_info(sidecar: Path) -> SourceInfo | None:
             source_hash=str(data.get("source_hash", "")),
             source_bytes_hash=str(data.get("source_bytes_hash", "")),
             source_name=str(data.get("source_name", "")),
+            source_path=str(data.get("source_path", "")),
             lang_in=str(data.get("lang_in", "en")),
             lang_out=str(data.get("lang_out", "zh")),
             translator=str(data.get("translator", "")),

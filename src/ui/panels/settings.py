@@ -195,6 +195,13 @@ class SettingsPanel(QWidget):
         self._output_mode_combo.currentIndexChanged.connect(self._auto_save)
         lang_layout.addRow("输出模式:", self._output_mode_combo)
 
+        # 粗糙翻译布局（单栏覆盖 / 双栏对照）
+        self._rough_layout_combo = QComboBox()
+        self._rough_layout_combo.addItem("单栏（译文覆盖原文）", "mono")
+        self._rough_layout_combo.addItem("双栏（原文 | 译文对照）", "dual")
+        self._rough_layout_combo.currentIndexChanged.connect(self._auto_save)
+        lang_layout.addRow("粗糙布局:", self._rough_layout_combo)
+
         root.addWidget(lang_group)
 
         # ── 操作 ──
@@ -266,6 +273,11 @@ class SettingsPanel(QWidget):
         if idx >= 0:
             self._output_mode_combo.setCurrentIndex(idx)
 
+        rough_layout = qs.value("rough_layout", "mono")
+        idx = self._rough_layout_combo.findData(rough_layout)
+        if idx >= 0:
+            self._rough_layout_combo.setCurrentIndex(idx)
+
     def save_settings(self) -> None:
         """持久化当前配置"""
         qs = self._qsettings
@@ -276,6 +288,7 @@ class SettingsPanel(QWidget):
         qs.setValue("lang_in", self._lang_in_combo.currentData())
         qs.setValue("lang_out", self._lang_out_combo.currentData())
         qs.setValue("output_mode", self._output_mode_combo.currentData())
+        qs.setValue("rough_layout", self._rough_layout_combo.currentData())
         qs.sync()  # 立即落盘，防止异常退出丢失设置
 
     def _auto_save(self, *_args) -> None:
@@ -295,6 +308,10 @@ class SettingsPanel(QWidget):
     @property
     def translate_btn(self) -> QPushButton:
         return self._translate_btn
+
+    @property
+    def rough_layout_combo(self) -> QComboBox:
+        return self._rough_layout_combo
 
     def set_pdf_loaded(self, path: str, loaded: bool = True) -> None:
         self._translate_btn.setEnabled(loaded)

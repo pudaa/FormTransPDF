@@ -25,6 +25,7 @@ class TextSpan:
     pdf_width: float
     pdf_height: float
     font_size: float
+    block_id: int = 0   # 所属文本块（PyMuPDF block 序号，用于段落级聚合）
     # 运行时由主线程填充
     content_rect: Optional[QRectF] = field(default=None)
 
@@ -59,6 +60,11 @@ class PdfTextExtractor(QObject):
         with self._lock:
             return not self._cancelled and self._current_doc_id == doc_id
 
+    def is_active(self, doc_id: int) -> bool:
+        """是否已有针对 doc_id 的提取任务在运行（避免重复启动）。"""
+        with self._lock:
+            return self._current_doc_id == doc_id and not self._cancelled
+
     def cancel(self):
         with self._lock:
             self._cancelled = True
@@ -84,7 +90,7 @@ class _ExtractWorker(QRunnable):
                 spans: List[TextSpan] = []
 
                 blocks = page.get_text("dict")["blocks"]
-                for block in blocks:
+                for block_idx, block in enumerate(blocks):
                     if block.get("type") != 0:
                         continue
                     for line in block["lines"]:
@@ -97,7 +103,8 @@ class _ExtractWorker(QRunnable):
                                 pdf_y=bbox[1],
                                 pdf_width=bbox[2] - bbox[0],
                                 pdf_height=bbox[3] - bbox[1],
-                                font_size=span["size"]
+                                font_size=span["size"],
+                                block_id=block_idx,
                             ))
 
                 if self.extractor.is_valid(self.doc_id):

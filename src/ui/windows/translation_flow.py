@@ -185,6 +185,7 @@ class _TranslationFlowMixin:
                 source_hash=content_hash,
                 source_bytes_hash=bytes_hash,
                 source_name=self._current_pdf.name,
+                source_path=str(self._current_pdf.resolve()),
                 lang_in=task.lang_in,
                 lang_out=task.lang_out,
                 translator=task.translator,
@@ -270,14 +271,41 @@ class _TranslationFlowMixin:
         QMessageBox.critical(self, "翻译错误", f"{event.message}\n\n{event.error_details}")
 
     def _on_download(self) -> None:
+        """下载翻译结果：BabelDoc 结果优先；无 BabelDoc 结果但有粗糙翻译时导出译文文本。"""
         target = self._dual_path or self._mono_path
-        if not target or not target.exists():
-            QMessageBox.information(self, "提示", "没有可下载的翻译结果")
+        if target and target.exists():
+            dest, _ = QFileDialog.getSaveFileName(
+                self, "保存翻译结果", target.name, "PDF 文件 (*.pdf)"
+            )
+            if dest:
+                try:
+                    shutil.copy2(str(target), str(dest))
+                    self._settings.set_status(f"已保存: {Path(dest).name}")
+                except Exception as exc:
+                    QMessageBox.critical(self, "保存失败", str(exc))
             return
-        dest, _ = QFileDialog.getSaveFileName(self, "保存翻译结果", target.name, "PDF 文件 (*.pdf)")
-        if dest:
-            try:
-                shutil.copy2(str(target), str(dest))
-                self._settings.set_status(f"已保存: {Path(dest).name}")
-            except Exception as exc:
-                QMessageBox.critical(self, "保存失败", str(exc))
+
+        # 无 BabelDoc 结果 → 导出粗糙翻译（内存译文，纯文本）
+        if self._viewer.has_rough_translations():
+            self._export_rough_text()
+            return
+
+        QMessageBox.information(self, "提示", "没有可下载的翻译结果")
+
+    def _export_rough_text(self) -> None:
+        """把粗糙翻译结果导出为纯文本（按页分段，未译段回退原文）。"""
+        text = self._viewer.rough_export_text()
+        if not text:
+            return
+        name = (self._current_pdf.name if self._current_pdf else "rough")
+        base = str(Path(name).stem)
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "保存粗糙翻译结果", f"{base}.rough.txt", "文本文件 (*.txt)"
+        )
+        if not dest:
+            return
+        try:
+            Path(dest).write_text(text, encoding="utf-8")
+            self._settings.set_status(f"已保存粗糙翻译: {Path(dest).name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))

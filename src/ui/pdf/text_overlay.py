@@ -16,11 +16,62 @@ from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QPushButton, QLabel, QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
 )
-from PySide6.QtCore import Qt, QPoint, QRectF, QTimer, QPropertyAnimation
-from PySide6.QtGui import QPainter, QColor
+from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, QTimer, QPropertyAnimation
+from PySide6.QtGui import (
+    QPainter, QColor, QFont, QTextDocument, QTextLayout, QTextOption, QPixmap,
+)
 
 from src.ui.base.icon_factory import svg_icon
 from src.ui.base.theme import theme_manager
+from src.ui.pdf.cover import COVER_TRANSPARENT, COVER_MODES
+
+# ── 覆盖层绘制常量 ──────────────────────────────────────────
+_COVER_BG = QColor("#FFFFFF")      # 覆盖白底
+_COVER_FG = QColor("#1A1A1A")      # 覆盖黑字
+_COVER_PAD = 2.0                   # 白底每侧外扩像素（覆盖原文抗锯齿边缘）
+# 渲染下限：base_px 低于此值的段不绘制（保持原文透出）。与「自适应下限」分离——
+# 碰撞时允许缩小，但绝不低于 _FIT_MIN_FONT_PX（避免缩到蚂蚁大小不可读）。
+_COVER_MIN_FONT_PX = 6.5
+# 自适应字号下限：碰撞挤压时译文最多缩到该像素大小，低于此宁可轻微溢出/裁切。
+_FIT_MIN_FONT_PX = 9.0
+_COVER_CACHE_LIMIT = 24            # 页 pixmap 缓存上限（超出全清）
+# CJK 字形填满 em 方框，同 pt 下视觉比拉丁大 ~15%，故乘以 0.85 让译文与原 PDF 视觉等高
+_CJK_VISUAL_SCALE = 0.85
+# 段落之间的最小间距（像素），白底向下扩张到此即截断，避免压到下一段
+_SEG_GAP = 4.0
+# 单段宽下限：低于此值不渲染。降低（原 12 → 6）让表格窄 cell 也能绘制。
+_SEG_MIN_WIDTH = 6.0
+# 行距系数：在 QTextLayout 实际 line.height 基础上乘以此值，给译文一点呼吸空间
+_LINE_LEADING = 1.18
+# 行间最小垂直间距（像素）：译文/回退行矩形之间绝不重叠的最小间隔。
+# 译文字体（微软雅黑）行高通常大于原文行 bbox 高度，若直接沿用原文行 top，
+# 相邻译文行会顶到上一行底 → 文字互相遮盖。布局器用 cursor_y 游标保证
+# 每行 top ≥ 上一行底 + _LINE_GAP。
+_LINE_GAP = 3.0
+
+
+def _has_cjk(text: str) -> bool:
+    """检测文本是否含中日韩字符（用于字体回退）。"""
+    for ch in text:
+        o = ord(ch)
+        if 0x4E00 <= o <= 0x9FFF or 0x3040 <= o <= 0x30FF or 0xAC00 <= o <= 0xD7AF:
+            return True
+    return False
+
+
+def _cover_font(text: str, pixel_size: float) -> QFont:
+    """按文本语言选择字体并调整像素尺寸。
+
+    CJK 字形在微软雅黑里填满 em 方框，同 pt 下视觉比拉丁字大 ~15%。
+    因此对 CJK 文本乘以 _CJK_VISUAL_SCALE，使译文在视觉上贴合原 PDF 文字大小。
+    像素尺寸公式：font_pt × layout_scale（与 PDF 渲染同坐标系，逐 pt 换算）。
+    """
+    family = "Microsoft YaHei UI" if _has_cjk(text) else "Segoe UI"
+    size = pixel_size * (_CJK_VISUAL_SCALE if _has_cjk(text) else 1.0)
+    font = QFont(family)
+    font.setPixelSize(max(1, int(round(size))))
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    return font
 
 
 class TextOverlay(QWidget):
@@ -39,6 +90,13 @@ class TextOverlay(QWidget):
         self.setStyleSheet("background: transparent;")
 
         self._highlights: List[QRectF] = []
+
+        # ── 覆盖层（粗糙翻译）状态 ──
+        self._cover_mode: str = COVER_TRANSPARENT
+        self._cover_pages: dict = {}       # page -> [CoverSegment]（content 坐标已就绪）
+        self._cover_layouts: dict = {}     # page -> PageLayout
+        self._cover_version: int = 0       # 数据/模式版本，变更时重建页缓存
+        self._cover_cache: dict = {}       # (page, scale_key, version) -> QPixmap
 
         # ── 浮动工具栏 ──
         # 父级必须是 viewport（而非本透明层）：WA_TransparentForMouseEvents 会使其
@@ -106,9 +164,469 @@ class TextOverlay(QWidget):
         self._toolbar.hide()
         self.update()
 
+    # ── 覆盖层（粗糙翻译）API ──────────────────────────────
+
+    @property
+    def cover_mode(self) -> str:
+        return self._cover_mode
+
+    def set_cover_mode(self, mode: str) -> None:
+        """切换覆盖层渲染模式（透明 / 白底原文 / 白底译文）。"""
+        if mode not in COVER_MODES:
+            return
+        if mode == self._cover_mode:
+            return
+        self._cover_mode = mode
+        self._cover_version += 1
+        self._cover_cache.clear()
+        self.update()
+
+    def set_cover(
+        self,
+        pages: dict,
+        layouts: dict,
+        bump: bool = False,
+    ) -> None:
+        """设置覆盖层数据。
+
+        :param pages:   page -> [CoverSegment]（content_rect 已由 viewer 计算）
+        :param layouts: page -> PageLayout（页矩形与缩放）
+        :param bump:    数据内容变化（译文到位/模式切换）时置 True，重建页缓存；
+                        仅滚动等视口变化时置 False，避免缓存抖动。
+        """
+        self._cover_pages = pages or {}
+        self._cover_layouts = layouts or {}
+        if bump:
+            self._cover_version += 1
+            self._cover_cache.clear()
+        self.update()
+
+    def clear_cover(self) -> None:
+        self._cover_pages = {}
+        self._cover_layouts = {}
+        self._cover_mode = COVER_TRANSPARENT
+        self._cover_version += 1
+        self._cover_cache.clear()
+        self.update()
+
+    # ── 覆盖层绘制 ─────────────────────────────────────────
+
+    def _scroll_offset(self) -> tuple[int, int]:
+        """当前视口滚动偏移（内容坐标 → viewport 坐标）。
+
+        覆盖层是 QPdfView viewport 的子控件，滚动条在其祖父 QPdfView 上。
+        """
+        try:
+            vp = self.parentWidget()
+            if vp is None:
+                return 0, 0
+            view = vp.parentWidget()
+            hs = view.horizontalScrollBar().value() if hasattr(view, "horizontalScrollBar") else 0
+            vs = view.verticalScrollBar().value() if hasattr(view, "verticalScrollBar") else 0
+            return int(hs), int(vs)
+        except Exception:
+            return 0, 0
+
+    def _draw_cover(self, painter: QPainter) -> None:
+        """绘制覆盖层：按页绘制白底黑字（带按页 QPixmap 缓存）。"""
+        if self._cover_mode == COVER_TRANSPARENT or not self._cover_pages:
+            return
+        if not self._cover_layouts:
+            return
+
+        hs, vs = self._scroll_offset()
+        vp_rect = QRectF(0, 0, self.width(), self.height())
+
+        for page, segs in self._cover_pages.items():
+            layout = self._cover_layouts.get(page)
+            if layout is None or not segs:
+                continue
+            page_vp = layout.rect.translated(-hs, -vs)
+            if not page_vp.intersects(vp_rect):
+                continue
+
+            scale_key = int(layout.scale * 100)
+            key = (page, scale_key, self._cover_version)
+            pix = self._cover_cache.get(key)
+            if pix is None:
+                pix = self._render_page_pixmap(page, layout, segs)
+                if pix is None or pix.isNull():
+                    continue
+                self._cover_cache[key] = pix
+                if len(self._cover_cache) > _COVER_CACHE_LIMIT:
+                    self._cover_cache.clear()
+
+            painter.drawPixmap(page_vp.topLeft(), pix)
+
+    def _compute_next_y(
+        self, segs: list, page_h: float, origin
+    ) -> dict[int, float]:
+        """按 x 范围重叠规则计算每段向下扩展的下界 next_y。
+
+        替代旧版列感知（_cluster_columns + 25/75 分位裁剪 + 跨列 overflow 单独列）三件套：
+        1. 不再把段归到「列」再做聚类 —— 直接以「下方哪个段的 x 与本段重叠」作边界。
+        2. 全宽段（width > page_w × 0.5）天然与所有下方段 x 重叠 → 退回为页底或最近段顶。
+        3. 段之间不存在水平重叠 → 自然不互相覆盖（PDF 文字流本质保证）。
+        4. 段与段的下方重叠判定使用 2px 缓冲，规避抗锯齿/坐标舍入造成的假接触。
+
+        :returns: id(seg) -> 下一页内 y 上限（已扣 _SEG_GAP；无下方重叠段 → 页底）。
+        """
+        items = [s for s in segs if s.content_rect and not s.content_rect.isEmpty()]
+        page_bottom = origin.y() + float(page_h)
+        next_y_by_seg: dict[int, float] = {}
+        for seg in items:
+            r = seg.content_rect
+            below_y = []
+            for b in items:
+                if b is seg:
+                    continue
+                br = b.content_rect
+                if br.y() <= r.y() + 1:
+                    continue
+                # x 重叠判定（2px 容差）：保证白底向下扩张只在「同段所在视觉列」
+                if br.right() > r.left() + 2 and br.left() < r.right() - 2:
+                    below_y.append(br.y())
+            next_y_by_seg[id(seg)] = (
+                min(below_y) - _SEG_GAP if below_y else page_bottom
+            )
+        return next_y_by_seg
+
+    def _compute_next_x(
+        self, segs: list, page_w: float, origin
+    ) -> dict[int, float]:
+        """按「右侧 y 重叠段」计算每段横向可用右边界 next_x。
+
+        与 _compute_next_y（纵向碰撞）对称的**横向碰撞**：
+        - 对每段，右侧最近的、y 范围与本段重叠的段，其左边缘即横向边界；
+        - 右侧没有碰撞段（如页眉/单行短段）→ 边界 = 页宽（译文可占满整页，
+          不再被原文行宽自限换行 —— 数字截断 bug 的根因修复）；
+        - 返回值为页面局部 x 坐标（已扣 _SEG_GAP），行宽 = next_x − 段左。
+
+        :returns: id(seg) -> 页面局部横向右边界（content 坐标，已扣 GAP）。
+        """
+        items = [s for s in segs if s.content_rect and not s.content_rect.isEmpty()]
+        page_right = origin.x() + float(page_w)
+        next_x_by_seg: dict[int, float] = {}
+        for seg in items:
+            r = seg.content_rect
+            right_bound = page_right
+            for b in items:
+                if b is seg:
+                    continue
+                br = b.content_rect
+                # 在右侧（左边缘 ≥ 本段右边缘 − 2px 容差）且 y 范围重叠（±1px 容差）
+                if br.left() >= r.right() - 2:
+                    if br.top() < r.bottom() - 1 and br.bottom() > r.top() + 1:
+                        if br.left() < right_bound:
+                            right_bound = br.left()
+            next_x_by_seg[id(seg)] = right_bound - _SEG_GAP
+        return next_x_by_seg
+
+    def _layout_flow(self, text: str, font, line_rects: list,
+                     fallback_rect: tuple, line_width: float | None = None,
+                     base_x: float | None = None) -> tuple:
+        """逐行流动排版：译文在「可用行宽」里换行，行间做碰撞消除。
+
+        智能断行（WordWrap，Qt 默认）：中文任意处断行，**数字/英文按词不拆**
+        （之前用 WrapAnywhere 会把 "1993" 硬拆成 "(1"+"993"）。
+        行宽来源：
+        - `line_width` 提供（推荐）：横向碰撞可用宽度 —— 右侧没有碰撞段/没到
+          页边时，译文可占满可用空间，**不再被原文行宽自限换行**（根因修复）；
+        - 否则退化为原文行宽（旧行为，兼容调用方）。
+        行 X 起点：
+        - `base_x` 提供（推荐）：**所有译文行统一从该 X 起排（左对齐整齐）**——
+          原文段落存在首行缩进/悬挂缩进/参差短行时，各行 lx 不同，若译文行跟随
+          各自原文行 x，会出现「第二行左侧大量空白、第三行继承缩进」的奇怪缩进；
+        - 否则退化为跟随原文行 x（旧行为，兼容调用方）。
+        行间碰撞消除：译文字体行高通常大于原文行 bbox，直接用原文行 top 会顶到
+        上一行底 → cursor_y 单调递增游标保证任意两行矩形互不重叠。
+
+        返回 (tl, draw_rects, text_h)：draw_rects 为每行页面局部矩形 (x,y,w,h)。
+        """
+        tl = QTextLayout(text)
+        tl.setFont(font)
+        t_opt = QTextOption()
+        # 智能断行：中文任意断，数字/英文按词不拆（数字截断 bug 根因修复）
+        t_opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+        tl.setTextOption(t_opt)
+        tl.beginLayout()
+        draw_rects: list[tuple[float, float, float, float]] = []
+        if line_rects:
+            last_lx = line_rects[-1][0]
+            last_lw = line_rects[-1][2]
+            cursor_y = line_rects[0][1]  # 首行对齐原文首行 top
+            for (_lx, _ly, _lw, _lh) in line_rects:
+                line = tl.createLine()
+                if not line.isValid():
+                    break
+                lw = line_width if line_width is not None else _lw
+                line.setLineWidth(max(1.0, lw))
+                lh = max(_lh, line.height() * _LINE_LEADING)
+                # 碰撞消除：绝不顶到上一行；行距不足时顺延游标
+                ly = max(_ly, cursor_y)
+                x = base_x if base_x is not None else _lx
+                draw_rects.append((x, ly, lw, lh))
+                cursor_y = ly + lh + _LINE_GAP
+            # 剩余文本继续排（宽 = 最后一行宽，y 沿游标向下累加）
+            while True:
+                line = tl.createLine()
+                if not line.isValid():
+                    break
+                line.setLineWidth(max(1.0, last_lw if line_width is None else line_width))
+                hh = line.height() * _LINE_LEADING
+                x = base_x if base_x is not None else last_lx
+                draw_rects.append((x, cursor_y,
+                                   last_lw if line_width is None else line_width, hh))
+                cursor_y += hh + _LINE_GAP
+        else:  # 无行矩形（旧数据兜底）：整段单矩形内换行
+            fx, fy, fw, _fh = fallback_rect
+            y = fy
+            while True:
+                line = tl.createLine()
+                if not line.isValid():
+                    break
+                lw = line_width if line_width is not None else fw
+                line.setLineWidth(max(1.0, lw))
+                hh = line.height() * _LINE_LEADING
+                x = base_x if base_x is not None else fx
+                draw_rects.append((x, y, lw, hh))
+                y += hh + _LINE_GAP
+        tl.endLayout()
+        text_h = sum(h for (_x, _y, _w, h) in draw_rects)
+        return tl, draw_rects, text_h
+
+    def _render_page_pixmap(self, page: int, layout, segs) -> QPixmap | None:
+        """把一页的覆盖层（白底 + 文本）预渲染为透明底 pixmap。
+
+        布局器逻辑（按段自身范围 + x 重叠碰撞消除）：
+        - **next_y**：每段向下扩展上限 = 与本段 x 重叠的最近下方段顶部 − GAP（无则页底）。
+          替代旧版「按 x 中心聚列 + 25/75 分位裁剪 + 跨列 overflow 单独全宽列」三件套：
+            · 列聚类会把横跨坏段既归到原列又归到 overflow 列 → 重复绘制全宽白底盖邻列；
+            · 分位裁剪在横跨坏段存在时拉偏列边界 → 本列段被裁窄 → 译文显示不全；
+            · 新方案不再做「列」抽象，直接以「x 范围是否重叠」判定，根除双重问题。
+        - **clip rect**：每段用自己的 content_rect（外扩 _COVER_PAD）水平裁剪，
+          垂直裁到 max_bottom = min(段底+白底扩张, next_y)。
+          保证：① 本段白底/文字完全覆盖本段原文；② 水平方向不会越界到不重叠的他段。
+        - **字号**：先按 base_px 排版；若 text_h > avail_h 则迭代缩小
+          （步长 0.9/0.8/0.7/0.65/0.6，floor = _COVER_MIN_FONT_PX），
+          真正放不下时才允许轻微裁切。标题/正文字号差异化恢复，跨列不互相挤小字号。
+        - **关键**：每行译文 drawText 前必须 p.setFont(font)（否则译文全用 painter
+          默认字体渲染，导致「均码变小」的视觉问题——这是覆盖层一直存在的核心 bug）。
+        """
+        w = max(1, int(round(layout.rect.width())))
+        h = max(1, int(round(layout.rect.height())))
+        dpr = self.devicePixelRatioF() or 1.0
+
+        pix = QPixmap(int(round(w * dpr)), int(round(h * dpr)))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(Qt.GlobalColor.transparent)
+
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        origin = layout.rect.topLeft()
+
+        # ── 每段的下方扩展上界（纵向碰撞：x 重叠规则）──
+        next_y_by_seg = self._compute_next_y(segs, float(h), origin)
+        # ── 每段的横向可用右边界（横向碰撞：右侧 y 重叠段 / 页边）──
+        next_x_by_seg = self._compute_next_x(segs, float(w), origin)
+
+        # 绘制顺序：普通段按 (y, x) 升序（上方先画）；**被拖拽偏移的浮动段最后画**，
+        # 浮在最上层 —— 拖出来的字块不被其他段的白底盖住。
+        def _float_key(s) -> tuple:
+            floating = (
+                getattr(s, "offset_x", 0.0) != 0.0
+                or getattr(s, "offset_y", 0.0) != 0.0
+            )
+            return (0 if floating else 1, s.content_rect.y(), s.content_rect.x())
+
+        ordered_segs = sorted(
+            [s for s in segs if s.content_rect and not s.content_rect.isEmpty()],
+            key=_float_key,
+        )
+
+        for seg in ordered_segs:
+            text = (seg.display_text or seg.text).strip()
+            if not text:
+                continue
+
+            # 用户拖拽偏移：整段平移（仅绘制位置，不参与碰撞计算）
+            off_x = getattr(seg, "offset_x", 0.0)
+            off_y = getattr(seg, "offset_y", 0.0)
+            is_floating = off_x != 0.0 or off_y != 0.0
+            r = seg.content_rect.translated(
+                -origin.x() + off_x, -origin.y() + off_y
+            )
+            base_px = seg.font_size * layout.scale
+            if base_px < _COVER_MIN_FONT_PX or r.width() < _SEG_MIN_WIDTH:
+                continue
+
+            # ── 行级矩形（PDF 坐标 → 页面局部 content 坐标）──
+            line_rects = []
+            if seg.line_rects:
+                for (x0_p, y0_p, x1_p, y1_p) in seg.line_rects:
+                    line_rects.append((
+                        r.x() + (x0_p - seg.pdf_x) * layout.scale,
+                        r.y() + (y0_p - seg.pdf_y) * layout.scale,
+                        (x1_p - x0_p) * layout.scale,
+                        (y1_p - y0_p) * layout.scale,
+                    ))
+            fallback_rect = (r.x(), r.y(), r.width(), r.height())
+            if not line_rects:
+                line_rects = [fallback_rect]
+
+            # ── 可用高度：普通段受「下方 x 重叠段」限制；浮动段放开到页底 ──
+            if is_floating:
+                avail_h = max(0.0, float(h) - r.y() - _SEG_GAP)
+            else:
+                avail_h = max(
+                    0.0,
+                    next_y_by_seg[id(seg)] - origin.y() - r.y() - _SEG_GAP,
+                )
+
+            # ── 可用宽度（横向碰撞）：行宽 = 右侧边界 − 段左 − GAP ──
+            # 右侧没有碰撞段/没到页边时，译文可占满可用空间，不再被原文行宽
+            # 自限换行（数字截断 bug 根因修复）。浮动段沿用原位置碰撞宽度。
+            avail_w = max(
+                0.0,
+                next_x_by_seg[id(seg)] - origin.x() - r.x() - _SEG_GAP,
+            )
+            if avail_w < _SEG_MIN_WIDTH:
+                continue
+
+            # ── 字号 × 行宽 二维适配（字号优先：不第一时间压缩）──
+            # 设计：base 字号 + 横向碰撞可用宽度排版 → text_h：
+            #   - text_h ≤ avail_h → 直接用（放得下，不缩字号）；
+            #   - text_h > avail_h → 译文过长 → 才缩字号（档位 + 下限 _FIT_MIN_FONT_PX=9）；
+            #   - 兜底：全部档放不下 → 强制缩到 9，宁轻微溢出/裁切。
+            _FIT_SCALES = (1.0, 0.9, 0.8, 0.7, 0.65, 0.6)
+
+            font = _cover_font(text, base_px)
+            tl, draw_rects, text_h = self._layout_flow(
+                text, font, line_rects, fallback_rect, line_width=avail_w, base_x=r.x()
+            )
+            font_px = base_px
+            if text_h > avail_h + 1.0:
+                # 译文过长：缩字号（行宽保持碰撞可用宽度，每档尝试）
+                for scale in _FIT_SCALES[1:]:
+                    cand = max(base_px * scale, _FIT_MIN_FONT_PX)
+                    font = _cover_font(text, cand)
+                    tl, draw_rects, text_h = self._layout_flow(
+                        text, font, line_rects, fallback_rect, line_width=avail_w, base_x=r.x()
+                    )
+                    if text_h <= avail_h + 1.0 or cand <= _FIT_MIN_FONT_PX + 0.5:
+                        font_px = cand
+                        break
+                else:
+                    # 兜底：全部字号档放不下 → 强制缩到下限，宁轻微溢出/裁切
+                    cand = min(_FIT_MIN_FONT_PX, base_px)
+                    font = _cover_font(text, cand)
+                    tl, draw_rects, text_h = self._layout_flow(
+                        text, font, line_rects, fallback_rect, line_width=avail_w, base_x=r.x()
+                    )
+                    font_px = cand
+
+            # ── 段级白底高度：覆盖整段（含未译文行）──
+            orig_h = sum(h for (_lx, _ly, _w, h) in line_rects)
+            box_h = max(orig_h, text_h)
+            # 防御性封顶：不可超过本段到下方 x 重叠段的距离
+            box_h = min(box_h, max(r.height(), avail_h))
+            if is_floating:
+                # 浮动段（用户拖出查看）：垂直放开到自身白底，不被碰撞边界裁切
+                max_bottom = r.y() + box_h + 2 * _COVER_PAD
+            else:
+                max_bottom = min(
+                    r.y() + box_h + 2 * _COVER_PAD,
+                    next_y_by_seg[id(seg)] - origin.y(),
+                )
+            max_bottom = max(0.0, max_bottom)
+
+            # ── 横向 clip：本段左侧 → 横向碰撞右边界（next_x + pad）──
+            # 行宽已是碰撞可用宽度，clip 必须同步放开，否则译文/白底被裁回段宽。
+            x0 = max(0.0, r.x() - _COVER_PAD)
+            x1 = min(float(w), next_x_by_seg[id(seg)] - origin.x() + _COVER_PAD)
+            clip_w = max(0.0, x1 - x0)
+            if clip_w <= 0.0 or max_bottom <= 0.0:
+                continue
+            p.save()
+            p.setClipRect(QRectF(x0, 0.0, clip_w, max_bottom))
+
+            # ── 段级不透明白底：覆盖到横向碰撞右边界（含未译原文行 + 可用空白）──
+            # 宽度 = 碰撞可用宽度 + GAP + pad，让译文段视觉上「撑满」可用列宽。
+            bg_w = min(float(w), next_x_by_seg[id(seg)] - origin.x()) - r.x()
+            p.fillRect(
+                QRectF(r.x() - _COVER_PAD, r.y() - _COVER_PAD,
+                       bg_w + 2 * _COVER_PAD, box_h + 2 * _COVER_PAD),
+                _COVER_BG,
+            )
+
+            # ── 译文行：每行独立白底 + 译文分片 ──
+            # ★ 关键修复：drawText 前必须 setFont，否则 painter 默认字体导致
+            #   所有译文「均码变小」。
+            #
+            # 对齐用 AlignVCenter（而非 AlignTop）：CJK 经 0.85 视觉补偿后比原
+            # 文字号略小，AlignTop 会让译文贴上行顶 → 行底留白。VCenter 让译文
+            # 在原始行 bbox 中垂直居中，标题/正文都更像原版排版。
+            _ALIGN = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            p.setFont(font)
+            for i, (lx, ly, lw, lh) in enumerate(draw_rects):
+                if ly + lh <= 0 or ly >= max_bottom:
+                    continue
+                line = tl.lineAt(i)
+                if not line.isValid():
+                    continue
+                p.fillRect(
+                    QRectF(lx - _COVER_PAD, ly - _COVER_PAD,
+                           lw + 2 * _COVER_PAD, lh + 2 * _COVER_PAD),
+                    _COVER_BG,
+                )
+                start = line.textStart()
+                line_text = text[start:start + line.textLength()]
+                if line_text:
+                    p.drawText(
+                        QRectF(lx, ly, lw, lh),
+                        _ALIGN,
+                        line_text,
+                    )
+
+            # ── 已译段译文较短：剩余原文行用「空白不透明白底」遮盖 ──
+            # 用户需求：不要用原文英文补绘（会造成"我到底在看哪一段"的误会），
+            # 白底精确覆盖原文即可；未翻译段（display_text 为 None）走主循环
+            # 整段原文显示，不受本分支影响。
+            if (
+                getattr(seg, "line_texts", None)
+                and len(draw_rects) < len(line_rects)
+            ):
+                # 从译文最后一行底 + _LINE_GAP 起作游标（行间碰撞消除同主循环）
+                fb_cursor = (
+                    draw_rects[-1][1] + draw_rects[-1][3] + _LINE_GAP
+                    if draw_rects else r.y()
+                )
+                for i in range(len(draw_rects), len(line_rects)):
+                    if i >= len(seg.line_texts):
+                        break
+                    lx, _ly0, lw, _lh0 = line_rects[i]
+                    lh = max(_lh0, 1.0)
+                    ly = max(_ly0, fb_cursor)
+                    if ly + lh <= 0 or ly >= max_bottom:
+                        continue
+                    # 只画不透明白底遮盖原文行，不绘制任何文字
+                    p.fillRect(
+                        QRectF(lx - _COVER_PAD, ly - _COVER_PAD,
+                               lw + 2 * _COVER_PAD, lh + 2 * _COVER_PAD),
+                        _COVER_BG,
+                    )
+                    fb_cursor = ly + lh + _LINE_GAP
+            p.restore()
+
+        p.end()
+        return pix
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        # 覆盖层（粗糙翻译白底黑字）先画，选区高亮叠在上面
+        self._draw_cover(painter)
 
         if self._highlights:
             painter.setBrush(QColor(0, 120, 255, 50))

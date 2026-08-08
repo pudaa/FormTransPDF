@@ -43,13 +43,24 @@ class TextSelectionMixin:
     # ── 高亮计算 ───────────────────────────────────────────
 
     def _update_highlights_for_selection(self, content_rect: QRectF):
-        """根据内容坐标系的选择矩形，计算并设置 viewport 高亮"""
+        """根据内容坐标系的选择矩形，计算并设置 viewport 高亮。
+
+        译文态（COVER_TRANSLATED）下选区对应的是译文段落（封面 segment），
+        高亮与显示的译文块对齐；其他模式仍按原始 span 高亮。
+        """
         highlights = []
-        for spans in self._text_spans.values():
-            for span in spans:
-                if span.content_rect and content_rect.intersects(span.content_rect):
-                    vp_rect = self._content_rect_to_viewport(span.content_rect)
-                    highlights.append(vp_rect)
+        if self._cover_mode == "translated" and self._cover_segments:
+            for page_num in sorted(self._cover_segments):
+                for seg in self._cover_segments[page_num]:
+                    if seg.content_rect and content_rect.intersects(seg.content_rect):
+                        vp_rect = self._content_rect_to_viewport(seg.content_rect)
+                        highlights.append(vp_rect)
+        else:
+            for spans in self._text_spans.values():
+                for span in spans:
+                    if span.content_rect and content_rect.intersects(span.content_rect):
+                        vp_rect = self._content_rect_to_viewport(span.content_rect)
+                        highlights.append(vp_rect)
         self._text_overlay.set_highlights(highlights)
 
     def _refresh_highlights(self):
@@ -59,9 +70,18 @@ class TextSelectionMixin:
         self._update_highlights_for_selection(self._selected_content_rect)
 
     def _get_text_in_rect(self, content_rect: QRectF) -> str:
-        """获取选择矩形内的文本（按页面顺序拼接）"""
+        """获取选择矩形内的文本（按页面顺序拼接）。
+
+        译文态（COVER_TRANSLATED）下选区对应译文段落，复制得到译文；
+        其他模式返回原文 span 文本。
+        """
         texts = []
-        # 按页码排序，保证阅读顺序
+        if self._cover_mode == "translated" and self._cover_segments:
+            for page_num in sorted(self._cover_segments):
+                for seg in self._cover_segments[page_num]:
+                    if seg.content_rect and content_rect.intersects(seg.content_rect):
+                        texts.append(seg.display_text or seg.text)
+            return "".join(texts)
         for page_num in sorted(self._text_spans.keys()):
             spans = self._text_spans[page_num]
             for span in spans:
@@ -113,6 +133,57 @@ class TextSelectionMixin:
     def _add_permanent_highlight(self):
         """添加永久高亮"""
         print(f"标记高亮: {self._selected_text[:50]}")
+
+    # ── 字块拖拽（Alt+左键：把被遮盖的字块拖出来查看）──────────
+
+    def _on_drag_press(self, me: QMouseEvent) -> bool:
+        """Alt+左键按下：命中段则进入拖拽（整段平移）。返回 True 表示消费。
+
+        仅在覆盖层可见的模式（译文/原文覆盖）下启用 —— 透明态没有白底可拖。
+        """
+        if self._cover_mode == "transparent":
+            return False
+        seg = self.cover_segment_at(me.pos())
+        if seg is None:
+            return False
+        self._drag_seg = seg
+        self._drag_start_pos = me.pos()
+        self._drag_orig_offset = (seg.offset_x, seg.offset_y)
+        vp = self._pdf_view.viewport()
+        if vp is not None:
+            vp.setCursor(Qt.CursorShape.ClosedHandCursor)
+        return True
+
+    def _on_drag_move(self, me: QMouseEvent) -> bool:
+        """拖拽移动：按鼠标位移更新命中段偏移并重绘。返回 True 表示消费。"""
+        if self._drag_seg is None:
+            return False
+        delta = me.pos() - self._drag_start_pos
+        self._drag_seg.offset_x = self._drag_orig_offset[0] + float(delta.x())
+        self._drag_seg.offset_y = self._drag_orig_offset[1] + float(delta.y())
+        self._push_cover(bump=True)  # 每次移动重建页缓存（段多时仍可接受）
+        return True
+
+    def _on_drag_release(self, me: QMouseEvent) -> bool:
+        """拖拽释放：结束拖拽（保持偏移），恢复光标。返回 True 表示消费。"""
+        if self._drag_seg is None:
+            return False
+        self._drag_seg = None
+        self._drag_start_pos = QPoint()
+        vp = self._pdf_view.viewport()
+        if vp is not None:
+            vp.setCursor(Qt.CursorShape.ArrowCursor)
+        return True
+
+    def _on_drag_double_click(self, me: QMouseEvent) -> bool:
+        """双击命中段：复位其拖拽偏移。返回 True 表示消费。"""
+        seg = self.cover_segment_at(me.pos())
+        if seg is None:
+            return False
+        seg.offset_x = 0.0
+        seg.offset_y = 0.0
+        self._push_cover(bump=True)
+        return True
 
     # ── 左键划词状态机 ────────────────────────────────────
 
