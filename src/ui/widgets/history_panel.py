@@ -1,28 +1,32 @@
 """
-翻译历史记录组件 — 扫描 output/ 目录展示已完成翻译
+翻译历史记录组件 — 扫描 output/ 目录展示已完成翻译，支持单个/批量删除
 """
 
 from __future__ import annotations
 
+import logging
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from src.core.translation.records import SIDECAR_SUFFIX, read_source_info
-from src.ui.base.icon_factory import accent_icon
-from src.ui.base.theme import Colors
+from src.ui.base.icon_factory import svg_icon, svg_pixmap
+from src.ui.base.theme import Colors, ThemeMode, _contrast_text, theme_manager
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -42,6 +46,45 @@ class HistoryEntry:
     source_bytes_hash: str = ""  # 源文件字节指纹（sidecar 提供）
     source_name: str = ""       # 原始源文件名（sidecar 提供）
     source_path: str = ""       # 原文件绝对路径（sidecar 提供；历史打开原文用）
+    sidecar: Path | None = None  # 源文件指纹 sidecar（删除时一并清理）
+
+
+# ═══════════════════════════════════════════════════════════════
+# 可勾选列表（选择模式下：checkbox 区域由 Qt 处理，其余区域点击切换勾选）
+# ═══════════════════════════════════════════════════════════════
+
+class _CheckableList(QListWidget):
+    """整行点击可切换勾选的 QListWidget。
+
+    选择模式下：点击可勾选 item 的任意区域（含 checkbox 指示器）都手动切换
+    checkState 一次；不调用基类 mousePressEvent 处理，因此 Qt 不会在其
+    release 阶段的 editorEvent 中再次切换，避免双重翻转。状态统一由
+    itemChanged 信号驱动外部按钮更新。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._select_mode = False
+
+    def set_select_mode(self, active: bool) -> None:
+        self._select_mode = active
+
+    def mousePressEvent(self, event) -> None:
+        if not self._select_mode:
+            super().mousePressEvent(event)
+            return
+        pos = event.position().toPoint()
+        item = self.itemAt(pos)
+        if item is not None and (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+            # 任意区域点击均手动切换一次（不调用 super，杜绝 Qt 自动切换的双重翻转）
+            item.setCheckState(
+                Qt.CheckState.Unchecked
+                if item.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+            self.setCurrentItem(item)
+            return
+        super().mousePressEvent(event)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -49,69 +92,141 @@ class HistoryEntry:
 # ═══════════════════════════════════════════════════════════════
 
 class HistoryPanel(QWidget):
-    """扫描 output/ 目录，以列表展示历史翻译记录"""
+    """扫描 output/ 目录，以列表展示历史翻译记录，支持单个/批量删除"""
 
     result_selected = Signal(str, str, str, str)  # dual_path, mono_path, display_name, source_path
+    about_to_delete_files = Signal(list)  # 确认删除后、执行删除前发出将被删除的文件列表（供释放句柄）
 
     def __init__(self, output_dir: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._output_dir = output_dir
         self._entries: list[HistoryEntry] = []
+        self._select_mode = False      # 多选删除模式
+        self._last_selected_name = ""  # 主题刷新后恢复选中项
 
         self.setObjectName("historyPanel")
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 1, 0, 0)
-        layout.setSpacing(4) # 列表项间距
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(4)
 
-        # 标题行
-        # header = QHBoxLayout()
-        # title = QLabel("历史记录")
-        # title.setStyleSheet(
-        #     f"color: {Colors.ASH.name() if hasattr(Colors, 'ASH') else '#8a8578'};"
-        #     "font-size: 10pt; font-weight: 600;"
-        # )
-        # header.addWidget(title)
+        # ── 标题行：历史记录 + 选择 / 删除 ──
+        header = QHBoxLayout()
+        header.setSpacing(4)
 
-        # self._refresh_btn = QPushButton("↻")
-        # self._refresh_btn.setFixedSize(24, 24)
-        # self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        # self._refresh_btn.setToolTip("刷新历史记录")
-        # self._refresh_btn.clicked.connect(self.refresh)
-        # self._refresh_btn.setStyleSheet(
-        #     "QPushButton { background: transparent; border: none; font-size: 12pt; }"
-        #     "QPushButton:hover { color: #d4a853; }"
-        # )
-        # header.addWidget(self._refresh_btn)
-        # header.addStretch()
-        # layout.addLayout(header)
+        self._header_title = QLabel("历史记录")
+        self._header_title.setStyleSheet(
+            f"color: {Colors.ASH.name()}; font-size: 9pt; font-weight: 600;"
+            "background: transparent; padding-left: 2px;"
+        )
+        header.addWidget(self._header_title)
+        header.addStretch()
 
-        # 列表
-        self._list = QListWidget()
+        self._select_btn = QPushButton("选择")
+        self._select_btn.setToolTip("进入多选模式，可批量删除记录")
+        self._select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._select_btn.clicked.connect(self._toggle_select_mode)
+        header.addWidget(self._select_btn)
+
+        self._delete_btn = QPushButton("删除")
+        self._delete_btn.setToolTip("删除当前选中的历史记录")
+        self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._delete_btn.setEnabled(False)
+        self._delete_btn.clicked.connect(self._on_delete_clicked)
+        header.addWidget(self._delete_btn)
+
+        layout.addLayout(header)
+
+        # ── 列表 ──
+        self._list = _CheckableList()
         self._list.setAlternatingRowColors(False)
         self._list.setSpacing(2)
+        # 关闭焦点策略：根除选中项上的键盘焦点框（focus rect）——
+        # 历史列表以鼠标操作为主，不需要焦点框；否则列表获得焦点时
+        # Qt delegate 会在选中行绘制 1px 黑框，转移焦点后消失。
+        self._list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._list.itemClicked.connect(self._on_item_clicked)
-        self._list.setStyleSheet(
-            f"QListWidget {{ background: transparent; border: 1px solid {Colors.DIVIDER.name() if hasattr(Colors, 'DIVIDER') else '#2a2a30'};"
-            f"border-radius: 4px; padding: 2px; }}"
-            f"QListWidget::item {{ padding: 4px 6px; border-radius: 2px; font-size: 9pt; }}"
-            f"QListWidget::item:hover {{ background: {Colors.GOLD_MUTED.name() if hasattr(Colors, 'GOLD_MUTED') else '#3d3524'}; }}"
-            f"QListWidget::item:selected {{ background: {Colors.GOLD.name() if hasattr(Colors, 'GOLD') else '#d4a853'};"
-            f"color: #0d0d0d; }}"
-        )
-        layout.addWidget(self._list)
+        self._list.itemChanged.connect(self._on_item_state_changed)
+        self._list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._on_context_menu)
+        self._list.setStyleSheet(self._list_stylesheet())
+        layout.addWidget(self._list, stretch=1)
 
         # 空状态提示
         self._empty_label = QLabel("暂无翻译记录")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setStyleSheet(
-            f"color: {Colors.CHAR.name() if hasattr(Colors, 'CHAR') else '#4a4640'};"
+            f"color: {Colors.CHAR.name()};"
             "font-size: 9pt; font-style: italic; padding: 8px;"
         )
         self._empty_label.setVisible(False)
         layout.addWidget(self._empty_label)
+
+        self._apply_button_styles()
+
+    def _list_stylesheet(self) -> str:
+        """按当前主题生成列表 QSS（主题切换时由 refresh_theme 重建）
+
+        - :selected 与 :selected:!active 均显式声明，避免非激活窗口时
+          Qt 回退到系统默认选中样式（黑色边框来源）
+        - 选择模式 checkbox 指示器随主题着色；勾选态用主题对比色对勾
+        """
+        tp = theme_manager.palette
+        contrast = _contrast_text(tp.accent).name()
+        check_png = self._check_indicator_path()
+        return (
+            f"QListWidget {{ background: transparent;"
+            f"border: 1px solid {tp.divider.name()};"
+            f"border-radius: 4px; padding: 2px; }}"
+            f"QListWidget::item {{ padding: 5px 8px; border-radius: 3px; font-size: 9pt; }}"
+            f"QListWidget::item:hover {{ background: {tp.accent_muted.name()}; }}"
+            f"QListWidget::item:selected, QListWidget::item:selected:!active,"
+            f"QListWidget::item:selected:focus, QListWidget::item:focus {{"
+            f"  background: {tp.accent.name()};"
+            f"  color: {contrast};"
+            f"  border: none; outline: none; }}"
+            # ── 选择模式 checkbox 指示器（明暗主题联动）──
+            f"QListWidget::indicator {{ width: 14px; height: 14px;"
+            f"border: 1px solid {tp.text_secondary.name()}; border-radius: 3px;"
+            f"background: transparent; margin-right: 4px; }}"
+            f"QListWidget::indicator:hover {{ border-color: {tp.accent.name()}; }}"
+            f"QListWidget::indicator:checked {{ background: {tp.accent.name()};"
+            f"border-color: {tp.accent.name()};"
+            f"image: url(\"{check_png}\"); }}"
+        )
+
+    @staticmethod
+    def _check_indicator_path() -> str:
+        """渲染当前主题的勾选对勾 PNG（缓存到系统临时目录），返回正斜杠路径。
+
+        对勾颜色 = 强调色对比色（暗色主题金底→深色对勾；亮色主题青铜底→白色对勾）。
+        """
+        tp = theme_manager.palette
+        mode = "dark" if tp.mode == ThemeMode.DARK else "light"
+        cache_dir = Path(tempfile.gettempdir()) / "formtranspdf_theme"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        png = cache_dir / f"check_{mode}.png"
+        if not png.exists():
+            svg_pixmap("check", _contrast_text(tp.accent), 14).save(str(png), "PNG")
+        return str(png).replace("\\", "/")
+
+    def _apply_button_styles(self) -> None:
+        """标题行小按钮样式（随主题刷新）"""
+        tp = theme_manager.palette
+        style = (
+            f"QPushButton {{ background: transparent; color: {tp.text_secondary.name()};"
+            f"border: 1px solid {tp.divider.name()}; border-radius: 3px;"
+            f"padding: 2px 8px; font-size: 8pt; }}"
+            f"QPushButton:hover {{ background: {tp.accent_muted.name()};"
+            f"color: {tp.text_primary.name()}; }}"
+            f"QPushButton:disabled {{ color: {tp.text_disabled.name()};"
+            f"border-color: {tp.divider.name()}; }}"
+        )
+        for btn in (self._select_btn, self._delete_btn):
+            btn.setStyleSheet(style)
 
     # ═══════════════════════════════════════════════════════════
     # 扫描与刷新
@@ -120,11 +235,30 @@ class HistoryPanel(QWidget):
     def refresh(self) -> None:
         """重新扫描 output 目录"""
         self._entries = self._scan_output_dir()
+        self._last_selected_name = ""  # 扫描后不恢复旧选中
         self._rebuild_list()
+        self._update_delete_btn()
 
     def refresh_theme(self) -> None:
-        """主题切换后按新主题重建列表项图标"""
+        """主题切换后：重建 QSS / 图标 / 按钮样式，并尽量保持选中项"""
+        # 记住当前选中项（重建后恢复）
+        item = self._list.currentItem()
+        idx = self._item_index(item)
+        if idx is not None and 0 <= idx < len(self._entries):
+            self._last_selected_name = self._entries[idx].display_name
+
+        self._header_title.setStyleSheet(
+            f"color: {Colors.ASH.name()}; font-size: 9pt; font-weight: 600;"
+            "background: transparent; padding-left: 2px;"
+        )
+        self._empty_label.setStyleSheet(
+            f"color: {Colors.CHAR.name()};"
+            "font-size: 9pt; font-style: italic; padding: 8px;"
+        )
+        self._list.setStyleSheet(self._list_stylesheet())
+        self._apply_button_styles()
         self._rebuild_list()
+        self._update_delete_btn()
 
     def _scan_output_dir(self) -> list[HistoryEntry]:
         """扫描目录，按文件分组返回"""
@@ -188,6 +322,7 @@ class HistoryPanel(QWidget):
                         mono_pdf=None, dual_pdf=None, csv_path=None,
                         timestamp=f.stat().st_mtime,
                     )
+                entries[base].sidecar = f
                 info = read_source_info(f)
                 if info:
                     entries[base].source_hash = info.source_hash
@@ -234,11 +369,28 @@ class HistoryPanel(QWidget):
             return
 
         self._empty_label.setVisible(False)
-        for entry in self._entries:
-            item = QListWidgetItem(accent_icon("document", 14), f"  {entry.display_name}")
-            item.setData(Qt.ItemDataRole.UserRole, self._list.count() - 1)  # index
+        tp = theme_manager.palette
+        for i, entry in enumerate(self._entries):
+            item = QListWidgetItem(
+                svg_icon("document", tp.accent, 14), f"  {entry.display_name}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, i)
             item.setToolTip(self._build_tooltip(entry))
+            # 注意：QListWidgetItem 默认即含 ItemIsUserCheckable，浏览模式必须显式移除
+            if self._select_mode:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             self._list.addItem(item)
+
+        # 恢复选中（主题刷新等场景），使用后清空
+        if self._last_selected_name:
+            for i, entry in enumerate(self._entries):
+                if entry.display_name == self._last_selected_name:
+                    self._list.setCurrentRow(i)
+                    break
+        self._last_selected_name = ""
 
     @staticmethod
     def _build_tooltip(entry: HistoryEntry) -> str:
@@ -247,20 +399,174 @@ class HistoryPanel(QWidget):
             parts.append(f"单栏: {entry.mono_pdf.name}")
         if entry.csv_path:
             parts.append(f"词汇表: {entry.csv_path.name}")
+        if entry.source_name:
+            parts.append(f"源文件: {entry.source_name}")
         return "\n".join(p for p in parts if p)
 
     # ═══════════════════════════════════════════════════════════
     # 交互
     # ═══════════════════════════════════════════════════════════
 
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+    def _item_index(self, item: QListWidgetItem | None) -> int | None:
+        if item is None:
+            return None
         idx = item.data(Qt.ItemDataRole.UserRole)
+        return int(idx) if idx is not None else None
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        if self._select_mode:
+            # 选择模式：勾选切换由 _CheckableList.mousePressEvent / Qt 处理
+            # （itemChanged 已驱动按钮更新），这里仅兜底同步
+            self._update_delete_btn()
+            return
+
+        idx = self._item_index(item)
         if idx is None or idx >= len(self._entries):
             return
-        entry = self._entries[idx]
+        self._open_entry(self._entries[idx])
+
+    def _on_item_state_changed(self, item: QListWidgetItem) -> None:
+        """item checkState 变化（Qt 自动切换或整行点击切换）→ 同步删除按钮"""
+        if self._select_mode and item.data(Qt.ItemDataRole.UserRole) is not None:
+            self._update_delete_btn()
+
+    def _open_entry(self, entry: HistoryEntry) -> None:
         dual = str(entry.dual_pdf) if entry.dual_pdf else ""
         mono = str(entry.mono_pdf) if entry.mono_pdf else ""
         self.result_selected.emit(dual, mono, entry.display_name, entry.source_path)
+
+    def _on_context_menu(self, pos) -> None:
+        """右键菜单：单条删除（任何模式下可用）"""
+        item = self._list.itemAt(pos)
+        if item is None:
+            return
+        idx = self._item_index(item)
+        if idx is None or idx >= len(self._entries):
+            return
+        entry = self._entries[idx]
+        self._list.setCurrentItem(item)
+
+        menu = QMenu(self)
+        act_open = menu.addAction("打开")
+        menu.addSeparator()
+        act_delete = menu.addAction("删除此记录")
+        chosen = menu.exec(self._list.mapToGlobal(pos))
+        if chosen is act_open:
+            self._open_entry(entry)
+        elif chosen is act_delete:
+            self._confirm_and_delete([entry])
+
+    # ═══════════════════════════════════════════════════════════
+    # 选择模式（批量删除）
+    # ═══════════════════════════════════════════════════════════
+
+    def _toggle_select_mode(self) -> None:
+        self._select_mode = not self._select_mode
+        self._list.set_select_mode(self._select_mode)
+        self._select_btn.setText("完成" if self._select_mode else "选择")
+        self._select_btn.setToolTip(
+            "退出多选模式" if self._select_mode else "进入多选模式，可批量删除记录"
+        )
+        self._list.clearSelection()
+        self._rebuild_list()  # 重建：checkbox 出现/消失
+        self._update_delete_btn()
+
+    def _checked_entries(self) -> list[HistoryEntry]:
+        result = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                idx = self._item_index(item)
+                if idx is not None and 0 <= idx < len(self._entries):
+                    result.append(self._entries[idx])
+        return result
+
+    def _update_delete_btn(self) -> None:
+        if self._select_mode:
+            n = len(self._checked_entries())
+            self._delete_btn.setEnabled(n > 0)
+            self._delete_btn.setText(f"删除({n})" if n else "删除")
+            self._delete_btn.setToolTip("删除勾选的记录")
+        else:
+            # 浏览模式：点击 item 即打开历史，删除走右键菜单或「选择」模式，避免误删
+            self._delete_btn.setEnabled(False)
+            self._delete_btn.setText("删除")
+            self._delete_btn.setToolTip("点击「选择」进入多选模式后删除，或右键单条删除")
+
+    def _on_delete_clicked(self) -> None:
+        if self._select_mode:
+            entries = self._checked_entries()
+            if entries and self._confirm_and_delete(entries):
+                self._toggle_select_mode()  # 删除完成后退出选择模式
+        else:
+            idx = self._item_index(self._list.currentItem())
+            if idx is not None and 0 <= idx < len(self._entries):
+                self._confirm_and_delete([self._entries[idx]])
+
+    def _confirm_and_delete(self, entries: list[HistoryEntry]) -> bool:
+        """删除一组历史记录对应的所有文件（带确认）；返回是否已执行删除。"""
+        files = [
+            p for e in entries for p in self._entry_files(e)
+            if p is not None and p.exists()
+        ]
+        if not files:
+            self.refresh()
+            return True
+
+        shown = "、".join(e.display_name for e in entries[:3])
+        if len(entries) > 3:
+            shown += f" 等 {len(entries)} 条"
+        reply = QMessageBox.question(
+            self,
+            "删除历史记录",
+            f"将删除 {len(entries)} 条记录的 {len(files)} 个文件：\n{shown}\n\n"
+            "此操作不可恢复，确定删除？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+
+        # 执行删除前先通知外部释放文件句柄（viewer 会话缓存持有 QPdfDocument，
+        # Windows 下会锁定文件导致删除失败），信号同步直连，返回时已释放完毕。
+        self.about_to_delete_files.emit(files)
+
+        failed = 0
+        for p in files:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as exc:
+                failed += 1
+                logger.warning("Failed to delete %s: %s", p, exc)
+        self.refresh()
+        if failed:
+            QMessageBox.warning(
+                self, "部分删除失败",
+                f"{failed} 个文件删除失败（可能被占用），其余已删除。",
+            )
+        return True
+
+    @staticmethod
+    def _entry_files(e: HistoryEntry) -> list[Path | None]:
+        """一条记录对应的全部文件（dual / mono / csv / sidecar）"""
+        return [e.dual_pdf, e.mono_pdf, e.csv_path, e.sidecar]
+
+    def _on_selection_changed(self) -> None:
+        """选中变化：刷新选中项图标；浏览模式下同步删除按钮可用性"""
+        self._sync_item_icons()
+        if not self._select_mode:
+            self._update_delete_btn()
+
+    def _sync_item_icons(self) -> None:
+        """选中项图标切换为对比色，其余保持主题强调色（保证选中态可视）"""
+        tp = theme_manager.palette
+        sel = self._list.currentItem()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is sel:
+                item.setIcon(svg_icon("document", _contrast_text(tp.accent), 14))
+            else:
+                item.setIcon(svg_icon("document", tp.accent, 14))
 
 
 def _clean_name(base: str) -> str:

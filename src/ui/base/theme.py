@@ -422,7 +422,7 @@ QTabBar::tab:hover:!selected {{
 /* ── 分组框 ───────────────────────────────── */
 QGroupBox {{
     border: 1px solid {c.divider.name()};
-    border-radius: 4px; margin-top: 12px; padding-top: 16px;
+    border-radius: 4px; margin-top: 10px; padding-top: 6px;
     font-weight: 600; color: {c.accent.name()};
 }}
 QGroupBox::title {{

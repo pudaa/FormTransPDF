@@ -14,6 +14,9 @@ PDF 页面渲染与查看组件 — 基于 QPdfView (PySide6 QtPdf)
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import shiboken6
 from PySide6.QtCore import Qt, QPoint, QPointF, QEvent, QMargins, QRectF, QTimer, Signal
 from PySide6.QtGui import (
@@ -41,6 +44,8 @@ from src.ui.pdf.cover import (
     COVER_TRANSLATED,
 )
 from src.core.translation.rough import RoughTranslator
+
+logger = logging.getLogger(__name__)
 
 
 class PDFViewerCore(QWidget):
@@ -386,6 +391,50 @@ class PDFViewerCore(QWidget):
         self._doc = None
         self._session = None
         self._stack.setCurrentIndex(0)
+
+    def release_sessions(self, paths) -> None:
+        """释放指定路径的文档会话（销毁 QPdfDocument，解除 Windows 文件句柄占用）。
+
+        QPdfDocument 加载 PDF 后在 Windows 上持有文件句柄，且实测
+        close()/deleteLater()/GC 均无法释放（句柄随 C++ 对象析构才归还），
+        只能通过 shiboken6.delete() 立即销毁 C++ 对象。由于会话缓存
+        （_sessions）会长期保留文档对象，即使切换/清空视图，被查看过的
+        文件仍无法删除；删除外部文件前必须调用本方法。
+
+        :param paths: 文件路径集合（str 或 Path，可包含不存在的路径）
+        """
+        if not self._sessions:
+            return
+        targets = {str(Path(p).resolve()) for p in paths}
+        for key in list(self._sessions.keys()):
+            try:
+                key_resolved = str(Path(key).resolve())
+            except Exception:
+                key_resolved = key
+            if key_resolved not in targets:
+                continue
+            session = self._sessions.pop(key)
+            doc = session.get("doc")
+            if doc is None:
+                continue
+            try:
+                if not shiboken6.isValid(doc):
+                    continue
+            except RuntimeError:
+                continue
+            # 若正是当前显示文档，先卸载所有持有该 doc 的引用
+            if self._doc is doc:
+                self._rough.cancel()
+                self._text_extractor.cancel()
+                self._pdf_view.setDocument(None)
+                self._layout_engine.set_document(None)
+                self._doc = None
+                self._session = None
+                self._stack.setCurrentIndex(0)
+            try:
+                shiboken6.delete(doc)  # 立即析构 → 归还文件句柄
+            except Exception:
+                logger.debug("Failed to delete QPdfDocument for %s", key, exc_info=True)
 
     def shutdown(self) -> None:
         """窗口关闭前调用：断开视口跟踪信号、取消后台任务、卸载文档。

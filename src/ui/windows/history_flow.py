@@ -8,15 +8,49 @@ self._settings 等由 MainWindow.__init__ 初始化的状态。
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from PySide6.QtWidgets import QMessageBox
 
 from src.ui.widgets.document_tab_bar import DocumentTab
 
+logger = logging.getLogger(__name__)
+
 
 class _HistoryFlowMixin:
     """历史记录选择与双栏/单栏切换。"""
+
+    def _on_history_delete_files(self, files) -> None:
+        """历史记录删除前：释放 viewer 缓存的文档句柄，关闭引用被删文件的标签页。
+
+        QPdfDocument 在 Windows 上持有文件句柄且被 viewer 会话缓存长期引用，
+        被查看过的历史文件因此无法删除；此处先释放句柄再允许 HistoryPanel
+        执行 unlink。同时关闭引用被删文件的文档标签页，避免残留失效引用。
+        """
+        paths: set[str] = set()
+        for p in files:
+            try:
+                paths.add(str(Path(p).resolve()))
+            except Exception:
+                paths.add(str(p))
+
+        # 1. 释放 QPdfDocument 句柄（Windows 文件锁根因）
+        try:
+            self._viewer.release_sessions(paths)
+        except Exception:
+            logger.debug("release_sessions failed", exc_info=True)
+
+        # 2. 关闭引用被删文件的文档标签页（从后往前删，避免索引错乱）
+        for i in range(len(self._doc_tabs) - 1, -1, -1):
+            tab = self._doc_tabs[i]
+            refs = [p for p in (tab.dual_pdf, tab.mono_pdf, tab.source_pdf) if p]
+            try:
+                hit = any(str(p.resolve()) in paths for p in refs)
+            except Exception:
+                hit = False
+            if hit:
+                self._close_doc_tab(i)
 
     def _apply_history_result(self, entry) -> bool:
         """加载一条已有翻译结果（复用检测），作用于当前文档标签页。

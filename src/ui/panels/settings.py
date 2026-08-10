@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QSettings, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -28,11 +28,15 @@ from src.ui.base.theme import Colors, DIVIDER_STYLE, _contrast_text, theme_manag
 TRANSLATOR_OPTIONS: dict[str, dict] = {
     "openai": {
         "label": "OpenAI", "needs_key": True, "needs_model": True,
-        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3-mini", "o4-mini"],
+        # 2026-08: GPT-5.6 家族 GA；luna 最便宜，适合翻译场景
+        "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6", "gpt-5.5",
+                   "gpt-5.4-mini", "gpt-5.2", "gpt-5-mini", "gpt-4.1",
+                   "gpt-4o", "gpt-4o-mini"],
     },
     "deepseek": {
         "label": "DeepSeek", "needs_key": True, "needs_model": True,
-        "models": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
+        # 2026-07-24 起 deepseek-chat / deepseek-reasoner 已退役，仅剩 V4 两档
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
     },
     "deepl": {
         "label": "DeepL", "needs_key": True, "needs_model": False,
@@ -48,27 +52,37 @@ TRANSLATOR_OPTIONS: dict[str, dict] = {
     },
     "ollama": {
         "label": "Ollama（本地）", "needs_key": False, "needs_model": True,
-        "models": ["llama3", "qwen2.5", "mistral", "gemma3", "deepseek-r1"],
+        # 2026-08 主流本地模型（name:tag 格式，可按需 ollama pull）
+        "models": ["qwen3:8b", "qwen3:14b", "llama3.3:70b", "gemma3:27b",
+                   "gpt-oss:20b", "qwen2.5:7b", "deepseek-r1:8b"],
     },
     "zhipu": {
         "label": "智谱 GLM", "needs_key": True, "needs_model": True,
-        "models": ["glm-4-plus", "glm-4-flash", "glm-4-air"],
+        # 2026-06 GLM-5.2 开源上线；glm-4-flash 仍为免费档，翻译性价比高
+        "models": ["glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.6",
+                   "glm-4-flash", "glm-4-air", "glm-4-plus"],
     },
     "siliconflow": {
         "label": "SiliconFlow", "needs_key": True, "needs_model": True,
-        "models": ["Qwen/Qwen2.5-7B-Instruct", "deepseek-ai/DeepSeek-V3"],
+        "models": ["Qwen/Qwen2.5-7B-Instruct", "deepseek-ai/DeepSeek-V3",
+                   "Qwen/Qwen3-8B", "Qwen/Qwen3-14B"],
     },
     "gemini": {
         "label": "Gemini", "needs_key": True, "needs_model": True,
-        "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+        # 2026-08: 3.6 flash 为最新稳定版；flash-lite 最便宜
+        "models": ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite",
+                   "gemini-3.1-pro-preview", "gemini-3-flash-preview",
+                   "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
     },
     "groq": {
         "label": "Groq", "needs_key": True, "needs_model": True,
-        "models": ["llama-3.3-70b", "mixtral-8x7b", "gemma2-9b-it"],
+        "models": ["llama-3.3-70b-versatile", "llama-4-scout-17b-16e-instruct",
+                   "qwen/qwen3-32b", "openai/gpt-oss-120b", "llama-3.1-8b-instant"],
     },
     "grok": {
         "label": "Grok", "needs_key": True, "needs_model": True,
-        "models": ["grok-3-beta"],
+        # 2026-07 grok-4.5 上线；grok-3 已退役
+        "models": ["grok-4.5", "grok-4.3"],
     },
     "xinference": {
         "label": "Xinference", "needs_key": False, "needs_model": True,
@@ -76,7 +90,7 @@ TRANSLATOR_OPTIONS: dict[str, dict] = {
     },
     "azure": {
         "label": "Azure OpenAI", "needs_key": True, "needs_model": True,
-        "models": ["gpt-4o", "gpt-4o-mini"],
+        "models": ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-4o", "gpt-4o-mini"],
     },
     "qwenmt": {
         "label": "QwenMT", "needs_key": False, "needs_model": False,
@@ -84,7 +98,9 @@ TRANSLATOR_OPTIONS: dict[str, dict] = {
     },
     "claudecode": {
         "label": "Claude Code", "needs_key": True, "needs_model": True,
-        "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514"],
+        # 2026-06-15 起 claude-*-20250514 已退役，迁移到 Sonnet 5 / Opus 4.8
+        "models": ["claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7",
+                   "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     },
 }
 
@@ -92,6 +108,102 @@ LANGUAGE_OPTIONS = [
     ("en", "English"), ("zh", "中文"), ("ja", "日本語"), ("ko", "한국어"),
     ("fr", "Français"), ("de", "Deutsch"), ("es", "Español"), ("ru", "Русский"),
 ]
+
+# ═══════════════════════════════════════════════════════════════
+# 模型列表刷新（后台拉取真实可用模型）
+# ═══════════════════════════════════════════════════════════════
+
+# 支持"刷新模型列表"的服务：translator key -> (默认 base_url, 是否 OpenAI 兼容)
+_REFRESHABLE: dict[str, tuple[str | None, bool]] = {
+    "openai": ("https://api.openai.com/v1", True),
+    "deepseek": ("https://api.deepseek.com/v1", True),
+    "siliconflow": ("https://api.siliconflow.cn/v1", True),
+    "groq": ("https://api.groq.com/openai/v1", True),
+    "grok": ("https://api.x.ai/v1", True),
+    "zhipu": ("https://open.bigmodel.cn/api/paas/v4", True),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta", False),
+    "ollama": ("http://localhost:11434", False),
+}
+
+MODEL_CACHE_KEY_PREFIX = "model_cache_"
+
+
+class ModelFetcher(QThread):
+    """后台线程：拉取指定翻译服务的可用模型 ID 列表。
+
+    - OpenAI 兼容服务：GET {base}/v1/models → data[].id
+    - Ollama：GET {base}/api/tags → models[].name
+    - Gemini：GET {base}/models?key=... → models[].name（去掉 models/ 前缀）
+
+    失败不抛异常，通过 finished_err 信号回传错误信息。
+    """
+
+    finished_ok = Signal(str, list)  # (translator_key, model_ids)
+    finished_err = Signal(str, str)  # (translator_key, error_message)
+
+    def __init__(
+        self, translator: str, api_key: str, base_url: str, parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._translator = translator
+        self._api_key = api_key
+        self._base_url = base_url
+
+    def run(self) -> None:
+        try:
+            ids = self._fetch()
+            if ids:
+                self.finished_ok.emit(self._translator, ids)
+            else:
+                self.finished_err.emit(self._translator, "服务端未返回任何模型")
+        except Exception as exc:  # noqa: BLE001 — 后台线程错误统一走信号
+            self.finished_err.emit(self._translator, str(exc))
+
+    def _fetch(self) -> list[str]:
+        import json
+        import urllib.request
+
+        key = self._translator
+
+        # ── Ollama：/api/tags ──
+        if key == "ollama":
+            base = (self._base_url or "http://localhost:11434").rstrip("/")
+            req = urllib.request.Request(base + "/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+            return [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
+
+        # ── Gemini：{base}/models?key=... ──
+        if key == "gemini":
+            base = (
+                self._base_url
+                or "https://generativelanguage.googleapis.com/v1beta"
+            ).rstrip("/")
+            sep = "&" if "?" in base else "?"
+            url = f"{base}/models{sep}key={self._api_key or ''}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+            return [
+                m.get("name", "").removeprefix("models/")
+                for m in payload.get("models", [])
+                if m.get("name")
+            ]
+
+        # ── OpenAI 兼容：{base}/v1/models ──
+        default_base = _REFRESHABLE.get(key, (None, True))[0]
+        base = (self._base_url or default_base or "").strip().rstrip("/")
+        if not base:
+            raise RuntimeError("缺少 Base URL，无法获取模型列表")
+        if base.endswith("/v1") or base.endswith("/v4"):  # OpenAI / 智谱
+            url = base + "/models"
+        else:
+            url = base + "/v1/models"
+        headers = {"Authorization": f"Bearer {self._api_key or ''}"}
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        return [m.get("id", "") for m in payload.get("data", []) if m.get("id")]
 
 SETTINGS_ORG = "FormTransPDF"
 SETTINGS_APP = "FormTransPDF"
@@ -118,14 +230,14 @@ class SettingsPanel(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 8, 10, 8)
+        root.setContentsMargins(10, 4, 10, 6)
         root.setSpacing(6)
 
         # ── 翻译服务 ──
         svc_group = QGroupBox("翻译引擎")
         svc_layout = QFormLayout(svc_group)
         svc_layout.setSpacing(6)
-        svc_layout.setContentsMargins(8, 14, 8, 8)
+        svc_layout.setContentsMargins(8, 4, 8, 6)
 
         self._translator_combo = QComboBox()
         for key, meta in TRANSLATOR_OPTIONS.items():
@@ -140,13 +252,27 @@ class SettingsPanel(QWidget):
         self._api_key_input.textChanged.connect(self._auto_save)
         svc_layout.addRow("API Key:", self._api_key_input)
 
-        # 模型：可编辑下拉框
+        # 模型：可编辑下拉框 + 刷新按钮
+        model_row = QWidget()
+        model_row_layout = QHBoxLayout(model_row)
+        model_row_layout.setContentsMargins(0, 0, 0, 0)
+        model_row_layout.setSpacing(4)
+
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)
         self._model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._model_combo.lineEdit().setPlaceholderText("输入或选择模型…")
         self._model_combo.currentTextChanged.connect(self._auto_save)
-        svc_layout.addRow("模型:", self._model_combo)
+        model_row_layout.addWidget(self._model_combo, 1)
+
+        self._refresh_btn = QPushButton("刷新")
+        self._refresh_btn.setFixedWidth(52)
+        self._refresh_btn.setToolTip("从服务端拉取最新可用模型列表（需已填写 API Key）")
+        self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._refresh_btn.clicked.connect(self._on_refresh_models)
+        model_row_layout.addWidget(self._refresh_btn)
+
+        svc_layout.addRow("模型:", model_row)
 
         self._base_url_input = QLineEdit()
         self._base_url_input.setPlaceholderText("留空使用默认")
@@ -173,7 +299,7 @@ class SettingsPanel(QWidget):
         lang_group = QGroupBox("语言")
         lang_layout = QFormLayout(lang_group)
         lang_layout.setSpacing(6)
-        lang_layout.setContentsMargins(8, 14, 8, 8)
+        lang_layout.setContentsMargins(8, 4, 8, 6)
 
         self._lang_in_combo = QComboBox()
         self._lang_out_combo = QComboBox()
@@ -330,6 +456,7 @@ class SettingsPanel(QWidget):
         self._lang_in_combo.setEnabled(not active)
         self._lang_out_combo.setEnabled(not active)
         self._select_btn.setEnabled(not active)
+        self._refresh_btn.setEnabled(not active)
 
     def set_status(self, text: str, is_error: bool = False) -> None:
         color = Colors.EMBER.name() if is_error else Colors.ASH.name()
@@ -384,9 +511,15 @@ class SettingsPanel(QWidget):
         self._model_combo.setVisible(needs_model)
         self._ollama_hint.setVisible(is_ollama)
 
-        # 更新模型下拉列表
+        # 刷新按钮：仅对支持模型列表接口的服务显示
+        self._refresh_btn.setVisible(needs_model and key in _REFRESHABLE)
+
+        # 更新模型下拉列表（内置建议 + 历史缓存合并，去重）
         if needs_model:
-            models = meta.get("models", [])
+            models = list(meta.get("models", []))
+            for m in self._load_model_cache(key):
+                if m not in models:
+                    models.append(m)
             current_text = self._model_combo.currentText()
             self._model_combo.clear()
             self._model_combo.addItems(models)
@@ -396,4 +529,72 @@ class SettingsPanel(QWidget):
                     self._model_combo.setCurrentIndex(idx)
                 else:
                     self._model_combo.setCurrentText(current_text)
+
+    # ═══════════════════════════════════════════════════════════
+    # 模型列表刷新（后台拉取）
+    # ═══════════════════════════════════════════════════════════
+
+    def _on_refresh_models(self) -> None:
+        key = self._translator_combo.currentData()
+        if key not in _REFRESHABLE or not self._model_combo.isVisible():
+            return
+        api_key = self._api_key_input.text().strip()
+        if key != "ollama" and not api_key:
+            self.set_status("请先填写 API Key，再刷新模型列表", is_error=True)
+            return
+        base_url = self._base_url_input.text().strip()
+        self._refresh_btn.setEnabled(False)
+        self._refresh_btn.setText("获取中…")
+        self.set_status(f"正在获取 {key} 可用模型…")
+        self._fetcher = ModelFetcher(key, api_key, base_url, self)
+        self._fetcher.finished_ok.connect(self._on_refresh_done)
+        self._fetcher.finished_err.connect(self._on_refresh_failed)
+        self._fetcher.finished.connect(self._fetcher.deleteLater)
+        self._fetcher.start()
+
+    def _on_refresh_done(self, key: str, ids: list[str]) -> None:
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText("刷新")
+        # 内置建议优先，拉取结果去重追加，并持久化缓存
+        meta = TRANSLATOR_OPTIONS.get(key, {})
+        merged = list(meta.get("models", []))
+        for m in ids:
+            if m not in merged:
+                merged.append(m)
+        self._save_model_cache(key, merged)
+        # 目标服务正是当前服务时，实时刷新下拉
+        if key == self._translator_combo.currentData() and self._model_combo.isVisible():
+            current_text = self._model_combo.currentText()
+            self._model_combo.clear()
+            self._model_combo.addItems(merged)
+            if current_text:
+                idx = self._model_combo.findText(current_text)
+                if idx >= 0:
+                    self._model_combo.setCurrentIndex(idx)
+                else:
+                    self._model_combo.setCurrentText(current_text)
+        self.set_status(f"模型列表已更新（共 {len(ids)} 个服务端模型）")
+
+    def _on_refresh_failed(self, key: str, err: str) -> None:
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText("刷新")
+        self.set_status(f"获取模型列表失败：{err}（继续使用内置列表）", is_error=True)
+
+    def _load_model_cache(self, key: str) -> list[str]:
+        """读取 QSettings 中缓存的模型列表（解析失败返回空）。"""
+        import json
+        raw = self._qsettings.value(MODEL_CACHE_KEY_PREFIX + key, "")
+        if not raw:
+            return []
+        try:
+            data = json.loads(str(raw))
+            return [str(x) for x in data] if isinstance(data, list) else []
+        except Exception:  # noqa: BLE001 — 缓存损坏时静默忽略
+            return []
+
+    def _save_model_cache(self, key: str, models: list[str]) -> None:
+        import json
+        self._qsettings.setValue(
+            MODEL_CACHE_KEY_PREFIX + key, json.dumps(models, ensure_ascii=False)
+        )
 

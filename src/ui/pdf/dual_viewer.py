@@ -130,6 +130,11 @@ class DualRoughViewer(QWidget):
         self._left.load_pdf(path)
         self._right.load_pdf(path)
 
+    def release_sessions(self, paths) -> None:
+        """释放左右两栏缓存的文档句柄（删除历史文件前调用）。"""
+        self._left.release_sessions(paths)
+        self._right.release_sessions(paths)
+
     def clear(self) -> None:
         self._left.clear()
         self._right.clear()

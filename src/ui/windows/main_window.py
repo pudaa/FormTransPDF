@@ -368,19 +368,14 @@ class MainWindow(
         sidebar.setStyleSheet(f"QWidget#sidebar {{ background-color: {tp.background.name()}; }}")
 
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(0)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
 
         brand = QLabel("FormTransPDF")
         brand.setObjectName("brandLabel")
         brand.setStyleSheet(f"background: transparent;")
         brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(brand)
-
-        sub = QLabel("论文翻译查看器")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setStyleSheet(f"color: {tp.text_secondary.name()}; font-size: 9pt; font-style: italic; padding-bottom: 4px; background: transparent;")
-        layout.addWidget(sub)
 
         # self._drop_zone = DropZone()
         # self._drop_zone.setMinimumHeight(72)
@@ -393,6 +388,16 @@ class MainWindow(
         self._progress = QProgressBar()
         self._progress.setVisible(False)
         layout.addWidget(self._progress)
+
+        # 设置区与历史区之间的分隔线（theme 切换时由 _refresh_theme 更新颜色）
+        self._sidebar_divider = QFrame()
+        self._sidebar_divider.setObjectName("sidebarDivider")
+        self._sidebar_divider.setFrameShape(QFrame.Shape.HLine)
+        self._sidebar_divider.setStyleSheet(
+            f"QFrame#sidebarDivider {{ background: {tp.divider.name()};"
+            "border: none; min-height: 1px; max-height: 1px; }"
+        )
+        layout.addWidget(self._sidebar_divider)
 
         # 历史记录
         self._history = HistoryPanel(self._output_dir)
@@ -961,6 +966,11 @@ class MainWindow(
         self.centralWidget().setStyleSheet(f"background-color: {tp.canvas.name()};")
         self._sidebar.setStyleSheet(f"QWidget#sidebar {{ background-color: {tp.background.name()}; }}")
         self._sidebar_sep.setStyleSheet(f"color: {tp.divider.name()};")
+        if hasattr(self, "_sidebar_divider"):
+            self._sidebar_divider.setStyleSheet(
+                f"QFrame#sidebarDivider {{ background: {tp.divider.name()};"
+                "border: none; min-height: 1px; max-height: 1px; }"
+            )
         self._apply_toolbar_styles()
         self._apply_tab_row_styles()
 
@@ -1000,6 +1010,8 @@ class MainWindow(
         self._signals.finished.connect(self._on_finished)
         self._signals.error_occurred.connect(self._on_error)
         self._history.result_selected.connect(self._on_history_selected)
+        # 历史删除前释放 viewer 句柄 + 关闭引用被删文件的标签页（Windows 文件锁）
+        self._history.about_to_delete_files.connect(self._on_history_delete_files)
         # 输出模式变更时（历史回放场景）切换双栏/单栏
         self._settings._output_mode_combo.currentIndexChanged.connect(
             self._on_output_mode_changed
