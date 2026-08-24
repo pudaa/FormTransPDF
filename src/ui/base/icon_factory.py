@@ -29,23 +29,39 @@ from src.ui.base.theme import theme_manager, _contrast_text
 
 
 def _data_root() -> Path:
-    """资源根目录：开发=项目 src/；PyInstaller=sys._MEIPASS；Nuitka=exe 同级。
+    """资源根目录：返回含 resources/ 子目录的那一级。
 
-    与 src/app.py 的 _get_data_path() 保持同一套布局（<根>/resources/...），
-    避免打包后 __file__ 解析不一致导致资源找不到。
+    探测顺序（不依赖 frozen/__compiled__ 标志，所有运行形态统一走同一套逻辑）：
+      1. PyInstaller: sys._MEIPASS（onefile/onedir 均指向解包根，spec 映射
+         resources/ 到该目录下）
+      2. 编译模块 __file__ 虚拟路径向上探测 —— Nuitka 官方文档 "Onefile:
+         Finding files" 推荐方式。注意 onefile 下 sys.executable 指向用户
+         启动的原始 exe 位置而非解压目录，不可依赖。开发模式下同样命中
+        （src/ui/base/icon_factory.py 向上到 src/）。
+      3. 兜底：exe 同级（standalone 布局）
+      4. 最终兜底：开发模式项目 src/
     """
-    if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS)                # PyInstaller
-    if getattr(sys, "__compiled__", False):
-        return Path(sys.executable).parent       # Nuitka
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass and (Path(meipass) / "resources").is_dir():
+        return Path(meipass)
+
+    probe = Path(__file__).resolve().parent
+    for _ in range(6):
+        if (probe / "resources").is_dir():
+            return probe
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+
     try:
         exe_dir = Path(sys.executable).parent
-        if "build-nuitka" in exe_dir.parts or "main.dist" in exe_dir.parts:
-            return exe_dir                        # Nuitka 兜底
+        if (exe_dir / "resources").is_dir():
+            return exe_dir
     except Exception:
         pass
-    # src/ui/base/icon_factory.py → 上三级即项目 src/（打包分支已提前返回）
-    return Path(__file__).resolve().parents[2]  # 开发模式：项目 src/
+
+    # 开发模式默认：src/ui/base/icon_factory.py → 上三级即项目 src/
+    return Path(__file__).resolve().parents[2]
 
 
 ICON_DIR = _data_root() / "resources" / "icons"

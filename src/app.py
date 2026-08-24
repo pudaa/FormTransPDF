@@ -79,14 +79,27 @@ class FormTransPDFApp(QApplication):
     def _get_data_path(self) -> Path:
         """获取打包后的数据文件根目录。
 
-        兼容 PyInstaller (sys._MEIPASS) 和 Nuitka (sys.executable 同级)。
+        兼容 PyInstaller (sys._MEIPASS)、Nuitka standalone (exe 同级)
+        与 Nuitka onefile (引导程序解压出的临时目录)。
         """
         if getattr(sys, "frozen", False):
             # PyInstaller
             return Path(sys._MEIPASS)
         if self._is_frozen():
-            # Nuitka standalone 或其他打包
-            return Path(sys.executable).parent
+            # Nuitka standalone：资源与 exe 同级
+            exe_dir = Path(sys.executable).parent
+            if (exe_dir / "resources").is_dir():
+                return exe_dir
+            # Nuitka onefile：数据文件在解压临时目录（官方文档 "Onefile: Finding files"），
+            # 编译模块的 __file__ 是该目录下的虚拟路径，向上探测 resources/
+            probe = Path(__file__).resolve().parent
+            for _ in range(3):
+                if (probe / "resources").is_dir():
+                    return probe
+                if probe.parent == probe:
+                    break
+                probe = probe.parent
+            return exe_dir
         return Path(__file__).resolve().parent
 
     def _set_app_icon(self) -> None:

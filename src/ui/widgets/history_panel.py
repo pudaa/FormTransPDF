@@ -477,13 +477,15 @@ class HistoryPanel(QWidget):
             self._update_delete_btn()
             return
 
-        if entry.is_rough:
-            self.rough_selected.emit(entry.source_path)
-            return
         idx = self._item_index(item)
         if idx is None or idx >= len(self._entries):
             return
-        self._open_entry(self._entries[idx])
+        entry = self._entries[idx]
+        if entry.is_rough:
+            # 粗译条目：直接回开源文件（自动命中缓存免翻译）
+            self.rough_selected.emit(entry.source_path)
+            return
+        self._open_entry(entry)
 
     def _on_item_state_changed(self, item: QListWidgetItem) -> None:
         """item checkState 变化（Qt 自动切换或整行点击切换）→ 同步删除按钮"""
