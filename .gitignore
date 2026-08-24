@@ -65,16 +65,15 @@ htmlcov/
 .classpath
 *.iml
 
-# ── GitHub ──
-.github/
-
 # ── 系统 ──
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# ── AI 工具 ──
+# ── AI 工具（本地辅助文件，不入库）──
 reasonix.toml
 .reasonix/
 .codegraph/
+.workbuddy/
+.github/
 AGENTS.md
