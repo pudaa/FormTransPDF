@@ -53,7 +53,10 @@ class DualRoughViewer(QWidget):
         layout.addWidget(splitter)
         self._splitter = splitter
 
-        # 信号转发：任一侧划词都可即时翻译；粗糙翻译状态来自右栏
+        # 信号转发：任一侧划词都可即时翻译；粗糙翻译状态来自右栏。
+        # text_layer_ready 两栏都转发：双栏下提取任务由左栏承担（load_pdf
+        # 先左后右，右栏命中共享会话跳过），只转发右栏会导致主窗口永远
+        # 收不到"文本层就绪"通知（历史粗译缓存不加载 / 按钮态不同步）。
         for src, dst in (
             (self._left.text_selected, self.text_selected),
             (self._right.text_selected, self.text_selected),
@@ -63,6 +66,7 @@ class DualRoughViewer(QWidget):
             (self._right.rough_ready, self.rough_ready),
             (self._right.rough_progress, self.rough_progress),
             (self._right.rough_stats, self.rough_stats),
+            (self._left.text_layer_ready, self.text_layer_ready),
             (self._right.text_layer_ready, self.text_layer_ready),
         ):
             src.connect(dst)

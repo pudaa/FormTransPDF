@@ -410,6 +410,10 @@ class PDFViewerCore(QWidget):
                 self._text_extractor.extract(session["path"], self._doc_id)
 
         self._on_viewport_changed()
+        # 兜底：QPdfView 的文档布局可能在事件循环后续才完成，立即刷新时
+        # layouts 可能为空 → span content_rect 未计算 → 首次划词失效。
+        # 延迟一拍再刷一次，确保缓存激活的视图"打开即可划词"。
+        QTimer.singleShot(0, self._on_viewport_changed)
 
     def clear(self) -> None:
         # 清空时取消后台任务与粗糙翻译（会话缓存保留，重载同路径可复用）
@@ -498,7 +502,11 @@ class PDFViewerCore(QWidget):
         self._disconnect_viewport_tracking()
         self._doc_id += 1
         self._text_extractor.cancel()
-        self._text_spans.clear()
+        # 注意：这里绝不能 _text_spans.clear() —— load_pdf（全新或缓存激活）
+        # 都会让 _text_spans 与 session["spans"] 指向同一 dict，clear() 会
+        # 连带清空会话池中的文本数据，而 extraction_complete 仍为 True 导致
+        # 不再重新提取 → 文本层永久丢失（双栏左栏 / 取消粗译后无法划词根因）。
+        # 内存释放交给会话生命周期管理（evict/_teardown_session/GC）。
         # 共享会话下另一栏可能还要补跑提取：解除本实例的"提取中"占位
         if self._session is not None:
             try:
@@ -681,7 +689,14 @@ class PDFViewerCore(QWidget):
 
     @property
     def text_layer_done(self) -> bool:
-        """当前文档的文本层是否已提取完成。"""
+        """当前文档的文本层是否已提取完成。
+
+        缓存激活（_activate_session）时该标志只反映激活瞬间的快照；
+        共享会话下另一栏可能稍后才完成提取 —— 动态读 session 才能拿到
+        真实状态，否则双栏右栏永远认为"提取中"而无法启动粗糙翻译。
+        """
+        if self._session is not None and self._session.get("doc_id") == self._doc_id:
+            return bool(self._session.get("extraction_complete"))
         return self._text_layer_done
 
     def rough_segment_count(self) -> int:
