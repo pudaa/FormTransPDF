@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
@@ -54,6 +54,15 @@ def _adjust_index(index: int, from_i: int, to_i: int) -> int:
     if to_i <= index < from_i:
         return index + 1
     return index
+
+
+# 触发拖拽的位移阈值（像素）：低于此值视为普通点击
+DRAG_THRESHOLD = 6
+# 其余标签向目标槽位缓动的每帧插值系数（浏览器式“挤压”手感）
+_DRAG_EASE = 0.38
+# 拖拽至视口边缘的自动滚动触发带宽度（像素）与每帧滚动速度
+_EDGE_MARGIN = 28
+_EDGE_SCROLL_SPEED = 12
 
 
 class _TabItem(QFrame):
@@ -137,11 +146,12 @@ class _TabItem(QFrame):
         if (
             event.buttons() & Qt.MouseButton.LeftButton
             and not self._drag_active
-            and (event.pos() - self._press_pos).manhattanLength() > 6
+            and (event.pos() - self._press_pos).manhattanLength() > DRAG_THRESHOLD
         ):
-            # 超过拖拽阈值：交由标签栏进入拖拽重排模式（标签栏 grabMouse）
+            # 超过拖拽阈值：交由标签栏进入拖拽重排模式（标签栏 grabMouse）。
+            # 传入按下点在标签内的 x 偏移，供拖拽签 1:1 跟随光标时保持抓取点。
             self._drag_active = True
-            self._on_drag_start(self._index)
+            self._on_drag_start(self._index, float(event.position().x()))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
@@ -169,9 +179,19 @@ class DocumentTabBar(QWidget):
         self.setFixedHeight(self.BAR_HEIGHT)
         self._items: list[_TabItem] = []
         self._active = -1
-        # 拖拽重排状态
-        self._drag_started = False
+        # ── 浏览器式拖拽状态 ──
+        # 拖拽期间所有标签脱离布局管理、由手动 setGeometry 控制：
+        # 拖拽签 1:1 跟随光标；其余签向「落点空位」两侧的目标槽位缓动（挤压）。
         self._drag_item: _TabItem | None = None
+        self._drag_orig_index = -1
+        self._drop_index = 0
+        self._grab_dx = 0.0          # 按下点在拖拽签内的 x 偏移（内容坐标）
+        self._last_bar_x = 0.0       # 最近一次光标的标签栏坐标（边缘滚动后回贴用）
+        self._targets: dict[int, float] = {}   # id(item) -> 目标 x（非拖拽项）
+        self._edge_dir = 0           # 边缘自动滚动方向（-1/0/1）
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)
+        self._anim_timer.timeout.connect(self._tick_drag)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -276,61 +296,210 @@ class DocumentTabBar(QWidget):
         if isinstance(item, _TabItem) and 0 <= item._index < len(self._items):
             self.tab_close_requested.emit(item._index)
 
-    # ── 拖拽重排 ──────────────────────────────────────────
+    # ── 浏览器式拖拽重排 ──────────────────────────────────
+    #
+    # 复刻 Chrome/Firefox 的三层机制：
+    #   1) 拖拽签脱离布局流，1:1 跟随光标（保持抓取点不跳）；
+    #   2) 其余标签按「落点空位」排列——落点由拖拽签中心与其余签槽位中点
+    #      实时比较得出；
+    #   3) 落点变化时其余签向新目标位缓动滑动（挤压/让位观感）。
+    #   释放时吸附落位、逻辑重排一次并交还布局管理。
 
-    def _on_item_drag_start(self, index: int) -> None:
-        """标签拖拽开始：抓取鼠标并进入重排模式。"""
-        if not (0 <= index < len(self._items)):
+    def _on_item_drag_start(self, index: int, grab_x: float) -> None:
+        """进入拖拽：全部标签脱离布局、锁定内容尺寸、启动动画帧。"""
+        if not (0 <= index < len(self._items)) or self._drag_item is not None:
             return
-        self._drag_started = True
-        self._drag_item = self._items[index]
+        drag = self._items[index]
+        self._drag_item = drag
+        self._drag_orig_index = index
+        self._drop_index = index
+        self._grab_dx = float(grab_x)
+        self._last_bar_x = self._item_center_bar_x(drag)
+
+        # 记录几何后全部移出布局（保留末尾 stretch），改由手动 setGeometry 控制
+        for it in self._items:
+            it._drag_y = it.y()
+            it._drag_h = it.height()
+            self._tabs_layout.removeWidget(it)
+        # 锁定内容尺寸：布局清空后 sizeHint 收缩会导致 QScrollArea 压缩内容宽
+        self._content.setMinimumSize(self._content.width(), self._content.height())
+
+        drag.raise_()
+        self._compute_targets()  # 初始目标 == 当前位置，无跳动
         self.grabMouse()
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self._anim_timer.start()
+
+    def _item_center_bar_x(self, item: _TabItem) -> float:
+        """标签中心在标签栏坐标系中的 x。"""
+        return item.mapTo(self, item.rect().center()).x()
+
+    def _content_x_from_bar(self, bar_x: float) -> float:
+        """标签栏坐标 → 内容坐标（计入视口偏移与横向滚动量）。"""
+        vp = self._scroll.viewport()
+        off = vp.mapTo(self, QPoint(0, 0)).x()
+        return bar_x - off + self._scroll.horizontalScrollBar().value()
 
     def mouseMoveEvent(self, event) -> None:
-        if self._drag_started and self._drag_item is not None:
-            pos = self._items.index(self._drag_item)
-            target = self._hovered_index(event.position().x())
-            if target is not None and target != pos:
-                self._move_tab_final(pos, target)
+        if self._drag_item is not None:
+            bar_x = float(event.position().x())
+            self._last_bar_x = bar_x
+            cx = self._content_x_from_bar(bar_x)
+            drag = self._drag_item
+            max_x = max(0, self._content.width() - drag.width())
+            nx = min(max(cx - self._grab_dx, 0.0), float(max_x))
+            drag.move(int(round(nx)), drag.y())
+            self._update_edge_scroll(bar_x)
+            self._update_drop()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if self._drag_started:
-            self._drag_started = False
-            self._drag_item = None
-            self.unsetCursor()
-            self.releaseMouse()
+        if self._drag_item is not None:
+            self._end_drag()
             return
         super().mouseReleaseEvent(event)
 
-    def _hovered_index(self, x: float) -> int | None:
-        """按光标 x（标签栏坐标系）返回最近的标签 index。"""
-        if not self._items:
-            return None
-        best, best_d = 0, 10**9
-        for i, it in enumerate(self._items):
-            cx = it.mapTo(self, it.rect().center()).x()
-            d = abs(x - cx)
-            if d < best_d:
-                best_d, best = d, i
-        return best
+    def _update_edge_scroll(self, bar_x: float) -> None:
+        """光标进入视口左右边缘触发带 → 标记自动滚动方向（由动画帧执行）。"""
+        if self._scroll.horizontalScrollBar().maximum() <= 0:
+            self._edge_dir = 0
+            return
+        vp = self._scroll.viewport()
+        local = bar_x - vp.mapTo(self, QPoint(0, 0)).x()
+        if local < _EDGE_MARGIN:
+            self._edge_dir = -1
+        elif local > vp.width() - _EDGE_MARGIN:
+            self._edge_dir = 1
+        else:
+            self._edge_dir = 0
 
-    def _move_tab_final(self, from_index: int, to_index: int) -> None:
-        """将标签移动到 to_index（最终位置，QTabBar.moveTab 语义）。"""
-        if from_index == to_index:
+    def _slot_xs(self, others: list[_TabItem], drop: int, drag_w: int) -> list[float]:
+        """其余标签在「drop 处插入 drag_w 空位」时的槽位 x（内容坐标）。"""
+        xs: list[float] = []
+        x = 0.0
+        for i, it in enumerate(others):
+            if i == drop:
+                x += drag_w + self.TAB_GAP
+            xs.append(x)
+            x += it.width() + self.TAB_GAP
+        return xs
+
+    def _update_drop(self) -> None:
+        """按拖拽签中心实时计算落点槽位；变化时刷新其余标签的目标位置。"""
+        drag = self._drag_item
+        if drag is None:
             return
-        if not (0 <= from_index < len(self._items)) or not (0 <= to_index < len(self._items)):
+        others = [it for it in self._items if it is not drag]
+        if not others:
             return
-        item = self._items.pop(from_index)
-        self._items.insert(to_index, item)
-        for i, it in enumerate(self._items):
-            it._index = i
+        drag_cx = drag.x() + drag.width() / 2
+        d = self._drop_index
+        for _ in range(3):  # 迭代收敛（单帧内至多跨越一两个槽位）
+            xs = self._slot_xs(others, d, drag.width())
+            nd = 0
+            for i, it in enumerate(others):
+                if drag_cx > xs[i] + it.width() / 2:
+                    nd = i + 1
+            if nd == d:
+                break
+            d = nd
+        if d != self._drop_index:
+            self._drop_index = d
+            self._compute_targets()
+
+    def _compute_targets(self) -> None:
+        """按「其余标签 + drop 处空位」的排列计算各非拖拽标签的目标 x。"""
+        drag = self._drag_item
+        if drag is None:
+            return
+        others = [it for it in self._items if it is not drag]
+        arranged = others[: self._drop_index] + [drag] + others[self._drop_index :]
+        x = 0.0
+        self._targets.clear()
+        for it in arranged:
+            if it is not drag:
+                self._targets[id(it)] = x
+            x += it.width() + self.TAB_GAP
+
+    def _tick_drag(self) -> None:
+        """16ms 动画帧：边缘自动滚动 + 其余标签向目标位缓动（挤压效果）。"""
+        if self._drag_item is None:
+            self._anim_timer.stop()
+            return
+        sb = self._scroll.horizontalScrollBar()
+        if self._edge_dir != 0 and sb.maximum() > 0:
+            nv = min(max(sb.value() + _EDGE_SCROLL_SPEED * self._edge_dir, 0), sb.maximum())
+            if nv != sb.value():
+                sb.setValue(nv)
+                # 滚动后重贴拖拽签位置，保持其仍抓在光标下
+                cx = self._content_x_from_bar(self._last_bar_x)
+                drag = self._drag_item
+                max_x = max(0, self._content.width() - drag.width())
+                drag.move(
+                    int(round(min(max(cx - self._grab_dx, 0.0), max_x))), drag.y()
+                )
+                self._update_drop()
+
+        for it in self._items:
+            if it is self._drag_item:
+                continue
+            tgt = self._targets.get(id(it))
+            if tgt is None:
+                continue
+            cur = it.x()
+            delta = tgt - cur
+            # 距目标 ≤1px 直接吸附：否则小数缓动会在 ±0.6px 附近形成
+            # 「round 后原地踏步」的定点循环（实测卡在 tgt+1 不收敛）
+            if abs(delta) <= 1.0:
+                nx = tgt
+            else:
+                nx = cur + delta * _DRAG_EASE
+            if int(round(nx)) != it.x():
+                it.move(int(round(nx)), it.y())
+
+    def _end_drag(self) -> None:
+        """结束拖拽：吸附落位 → 一次性逻辑重排 → 交还布局管理 → 发信号。"""
+        self._anim_timer.stop()
+        drag = self._drag_item
+        orig = self._drag_orig_index
+        drop = self._drop_index
+        self._drag_item = None
+        self._edge_dir = 0
+        self.unsetCursor()
+        try:
+            self.releaseMouse()
+        except RuntimeError:
+            pass
+
+        # 吸附到最终槽位（避免交还布局时跳变）
+        self._compute_targets()
+        for it in self._items:
+            if it is drag:
+                continue
+            tx = self._targets.get(id(it))
+            if tx is not None:
+                it.move(int(round(tx)), it.y())
+
+        moved = drag is not None and drop != orig
+        if moved:
+            self._items.pop(orig)
+            self._items.insert(drop, drag)
+            for i, it in enumerate(self._items):
+                it._index = i
+            self._active = _adjust_index(self._active, orig, drop)
+
+        # 恢复布局管理并复位拖拽态
+        self._content.setMinimumSize(0, 0)
         self._rebuild_tabs_layout()
-        self._active = _adjust_index(self._active, from_index, to_index)
-        self._apply_styles()
         self._relayout()
-        self.tabs_reordered.emit(from_index, to_index)
+        self._apply_styles()
+        if drag is not None:
+            drag._drag_active = False
+            drag._press_pos = QPoint()
+
+        if moved:
+            self.tabs_reordered.emit(orig, drop)
 
     def _rebuild_tabs_layout(self) -> None:
         """按当前 _items 顺序重建标签布局（保持末尾 stretch）。"""
@@ -414,6 +583,8 @@ class DocumentTabBar(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if self._drag_item is not None:
+            return  # 拖拽中几何由动画帧手动控制，避免布局重算打架
         self._relayout()
 
     def eventFilter(self, watched, event) -> bool:
