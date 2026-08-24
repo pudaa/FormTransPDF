@@ -13,7 +13,7 @@ try:
     from PySide6 import shiboken6  # pip 安装的 PySide6 通常在此
 except ImportError:  # conda 安装的 PySide6 把 shiboken6 作为顶层包
     import shiboken6
-from PySide6.QtCore import Qt, QRect, QEasingCurve, QPropertyAnimation, QSize, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QRect, QEasingCurve, QPropertyAnimation, QSize, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QPainter,
@@ -92,6 +92,46 @@ class MinimapPanel(QWidget):
         self.show()
 
     # ── 公开方法 ────────────────────────────────────────────
+
+    def begin_load(self, page_count: int, sample_size: QSize | None = None) -> None:
+        """占位加载：先按首页纵横比铺白底占位图，缩略图随后增量填充。
+
+        大文档（数百页）同步渲染全部缩略图会长时间阻塞主线程，
+        改为「占位先行 + ThumbnailGenerator 分批回填」。
+        """
+        self._page_count = page_count
+        self._scroll_offset = 0
+        self._visible_range = (0.0, 0.0)
+        thumb_w = max(self.width() - 8, 10)
+        if sample_size is not None and sample_size.width() > 0:
+            h = max(int(thumb_w * sample_size.height() / sample_size.width()),
+                    self.MIN_PAGE_HEIGHT)
+        else:
+            h = 90
+        placeholder = QPixmap(thumb_w, h)
+        placeholder.fill(Qt.GlobalColor.white)
+        self._thumbnails = [placeholder.copy() for _ in range(page_count)]
+        self.refresh_geometry()
+        self.update()
+
+    def set_thumbnail(self, index: int, pixmap: QPixmap) -> None:
+        """增量回填单页缩略图（占位纵横比与真实渲染一致，偏移无需重算）。"""
+        if not (0 <= index < len(self._thumbnails)):
+            return
+        self._thumbnails[index] = pixmap
+        thumb_w = max(self.width() - 8, 10)
+        slot_h = max(pixmap.height(), self.MIN_PAGE_HEIGHT)
+        if index < len(self._page_pixmaps):
+            self._page_pixmaps[index] = pixmap.scaled(
+                thumb_w, slot_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.update()
+
+    @property
+    def page_count(self) -> int:
+        return self._page_count
 
     def load_document(self, page_count: int, thumbnails: list[QPixmap]) -> None:
         self._page_count = page_count
@@ -422,23 +462,91 @@ class MinimapPanel(QWidget):
 # 缩略图生成工具
 # ═══════════════════════════════════════════════════════════
 
+def _render_page_thumb(doc: QPdfDocument, index: int, thumb_scale: float) -> QPixmap | None:
+    """渲染单页缩略图（白底合成）。返回 None 表示渲染失败。"""
+    size = doc.pagePointSize(index)
+    thumb_w = max(int(size.width() * thumb_scale), 20)
+    thumb_h = max(int(size.height() * thumb_scale), 14)
+    image = doc.render(index, QSize(thumb_w, thumb_h))
+    if image.isNull():
+        return None
+    # 合成到与渲染图同尺寸的白色底板上（无边框，避免纵向空间浪费）
+    canvas = QImage(image.size(), QImage.Format.Format_ARGB32)
+    canvas.fill(QColor("#ffffff"))
+    p = QPainter(canvas)
+    p.drawImage(0, 0, image)
+    p.end()
+    return QPixmap.fromImage(canvas)
+
+
 def generate_thumbnails(doc: QPdfDocument, page_count: int, thumb_scale: float = 0.10) -> list[QPixmap]:
-    """从 QPdfDocument 生成全部页面的缩略图 — 白色底板（无额外边框，槽位不浪费）"""
+    """同步生成全部页面缩略图 — 仅适合小文档；大文档用 ThumbnailGenerator。"""
     from PySide6.QtGui import QPainter
     thumbnails: list[QPixmap] = []
-    white = QColor("#ffffff")
     for i in range(page_count):
-        size = doc.pagePointSize(i)
-        thumb_w = max(int(size.width() * thumb_scale), 20)
-        thumb_h = max(int(size.height() * thumb_scale), 14)
-        image = doc.render(i, QSize(thumb_w, thumb_h))
-        if image.isNull():
-            continue
-        # 合成到与渲染图同尺寸的白色底板上（无边框，避免纵向空间浪费）
-        canvas = QImage(image.size(), QImage.Format.Format_ARGB32)
-        canvas.fill(white)
-        p = QPainter(canvas)
-        p.drawImage(0, 0, image)
-        p.end()
-        thumbnails.append(QPixmap.fromImage(canvas))
+        pix = _render_page_thumb(doc, i, thumb_scale)
+        if pix is not None:
+            thumbnails.append(pix)
     return thumbnails
+
+
+class ThumbnailGenerator(QObject):
+    """大文档缩略图分批生成器 — 主线程 QTimer 分片，UI 不阻塞。
+
+    旧实现对数百页文档一次性同步 doc.render()，主线程阻塞可达数十秒
+    （应用"未响应"假死）。本生成器每 interval_ms 渲染 batch_size 页，
+    通过 batch_ready(start_index, pixmaps) 增量回填面板。
+    """
+
+    batch_ready = Signal(int, list)   # start_index, [QPixmap, ...]
+    finished = Signal()
+
+    def __init__(
+        self,
+        doc: QPdfDocument,
+        page_count: int,
+        thumb_scale: float,
+        batch_size: int = 6,
+        interval_ms: int = 25,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._doc = doc
+        self._count = page_count
+        self._scale = thumb_scale
+        self._batch = max(1, batch_size)
+        self._next = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self) -> None:
+        self._next = 0
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    @property
+    def done(self) -> bool:
+        return self._next >= self._count
+
+    def _tick(self) -> None:
+        if self._next >= self._count:
+            self._timer.stop()
+            self.finished.emit()
+            return
+        start = self._next
+        batch: list[QPixmap] = []
+        for _ in range(self._batch):
+            if self._next >= self._count:
+                break
+            pix = _render_page_thumb(self._doc, self._next, self._scale)
+            if pix is not None:
+                batch.append(pix)
+            self._next += 1
+        if batch:
+            self.batch_ready.emit(start, batch)
+        if self._next >= self._count:
+            self._timer.stop()
+            self.finished.emit()

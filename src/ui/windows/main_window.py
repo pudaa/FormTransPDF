@@ -336,9 +336,20 @@ class MainWindow(
         self._minimap = MinimapPanel(self._viewer)  # 缩略图导航
         self._minimap.page_clicked.connect(self._on_minimap_page_clicked)
         self._minimap.viewport_dragged.connect(self._on_minimap_dragged)
+        # 新面板无数据：清除文档键，_setup_minimap 将重新异步生成缩略图
+        self._mm_doc_key = None
 
     def _destroy_minimap(self) -> None:
         """销毁当前 minimap（viewer 重建前调用，避免残留指向已删对象的引用）。"""
+        # 先停止进行中的缩略图分批生成（其回调持有旧面板引用）
+        gen = getattr(self, "_thumb_gen", None)
+        if gen is not None:
+            try:
+                gen.stop()
+            except RuntimeError:
+                pass
+            self._thumb_gen = None
+        self._mm_doc_key = None
         mm = self._minimap
         was_synced = self._minimap_synced
         self._minimap = None

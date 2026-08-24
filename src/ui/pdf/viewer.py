@@ -156,6 +156,12 @@ class PDFViewerCore(QWidget):
         # 流式期间收到译文的脏页累积器：防抖到期只重建这些页的缓存；
         # None 表示「全量刷新」（模式切换/完成时）
         self._pending_dirty: set[int] | None = None
+        # 文本提取期间的视口刷新去抖：每页到达只做轻量存储，合并后一次重算。
+        # 大文档（数百页）逐页全量重算会在主线程形成千万级操作，冻结 UI
+        self._extract_refresh = QTimer(self)
+        self._extract_refresh.setSingleShot(True)
+        self._extract_refresh.setInterval(60)
+        self._extract_refresh.timeout.connect(self._on_viewport_changed)
 
         # ── 字块拖拽（复杂布局下把被遮盖的段拖出来查看）──
         # Alt+左键拖拽命中段 → 段整体平移（offset_x/y），松开保持，双击复位。
@@ -631,14 +637,22 @@ class PDFViewerCore(QWidget):
         # ── 诊断：对比引擎计算的 content 尺寸与 QPdfView 实际 scrollbar ──
         self._diagnose_layout(layouts, vp)
 
-        # 更新所有页面的 span 坐标
+        # 坐标更新只处理「可见窗口 ±1.5 屏」内的页面：大文档对全部页面逐页
+        # 重算 span/segment 坐标是主线程灾难；远处页面在滚动临近时由后续
+        # 视口事件自然补算（选区/命中测试均发生在屏内，不受影响）
+        hs = self.horizontalScrollBar().value()
+        vs = self.verticalScrollBar().value()
+        margin = max(vp.width(), vp.height()) * 1.5
+        win = QRectF(hs, vs, vp.width(), vp.height()).adjusted(-margin, -margin, margin, margin)
+
+        # 更新可见窗口内页面的 span 坐标
         for layout in layouts:
-            if layout.page_num in self._text_spans:
+            if layout.rect.intersects(win) and layout.page_num in self._text_spans:
                 self._update_page_spans(layout)
 
         # 更新覆盖层 segment 坐标并推送
         for layout in layouts:
-            if layout.page_num in self._cover_segments:
+            if layout.rect.intersects(win) and layout.page_num in self._cover_segments:
                 self._update_page_cover(layout)
         self._push_cover()
 
@@ -977,8 +991,8 @@ class PDFViewerCore(QWidget):
                 page_size = None
         self._cover_segments[page_num] = build_segments(spans, page_size=page_size)
 
-        # 立即计算该页坐标（如果布局已就绪）
-        self._on_viewport_changed()
+        # 轻量存储后去抖合并重算：数百页逐页触发全文档视口重算会冻结 UI
+        self._extract_refresh.start()
 
     def _on_text_all_ready(self, doc_id: int):
         if doc_id == self._doc_id:
@@ -987,6 +1001,9 @@ class PDFViewerCore(QWidget):
                 self._session["extraction_complete"] = True
                 self._session["extracting"] = False
             logger.info("PDF 文本提取完成，共 %d 页", len(self._text_spans))
+            # 提取完成：立即做一次最终视口刷新（不等去抖）
+            self._extract_refresh.stop()
+            self._on_viewport_changed()
             self.text_layer_ready.emit()
 
     # ── resizeEvent ─────────────────────────────────────────

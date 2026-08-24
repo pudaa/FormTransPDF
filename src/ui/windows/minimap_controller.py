@@ -14,10 +14,10 @@ try:
     from PySide6 import shiboken6  # pip 安装的 PySide6 通常在此
 except ImportError:  # conda 安装的 PySide6 把 shiboken6 作为顶层包
     import shiboken6
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSize, QTimer
 from PySide6.QtPdf import QPdfDocument
 
-from src.ui.widgets.minimap import generate_thumbnails
+from src.ui.widgets.minimap import ThumbnailGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +31,57 @@ class _MinimapControllerMixin:
         return mm is not None and shiboken6.isValid(mm)
 
     def _setup_minimap(self) -> None:
-        """为当前 PDF 生成缩略图并加载到 minimap（默认隐藏，通过按钮唤起）"""
+        """为当前 PDF 加载缩略图到 minimap（异步分批生成，默认隐藏）。
+
+        大文档同步渲染全部页面会长时间阻塞主线程（数百页 → 数十秒假死），
+        改为：占位图先行 + ThumbnailGenerator 分批回填；同一文档重复调用
+        （切标签/切视图）直接复用已生成结果。
+        """
         if not self._minimap_alive():
             return
         doc = self._viewer.document
-        if doc is None or doc.status() != QPdfDocument.Status.Ready:
+        if doc is None or not shiboken6.isValid(doc):
+            return
+        if doc.status() != QPdfDocument.Status.Ready:
             return
         try:
-            thumbs = generate_thumbnails(
-                doc, self._viewer.page_count, thumb_scale=self._minimap.THUMB_SCALE
+            count = self._viewer.page_count
+            key = str(self._current_pdf) if self._current_pdf else f"doc:{id(doc)}"
+
+            # 同一文档且面板数据完整 → 跳过重新生成
+            if (
+                getattr(self, "_mm_doc_key", None) == key
+                and self._minimap.page_count == count
+                and self._minimap._thumbnails
+                and (getattr(self, "_thumb_gen", None) is None
+                     or self._thumb_gen.done)
+            ):
+                self._position_minimap()
+                self._update_minimap_viewport()
+                return
+
+            self._stop_thumb_gen()
+            sample = doc.pagePointSize(0) if count > 0 else None
+            # 占位先行：几何/滚动立即可用，缩略图随后回填
+            self._minimap.begin_load(count, QSize(sample.width(), sample.height()) if sample else None)
+            self._mm_doc_key = key
+
+            gen = ThumbnailGenerator(
+                doc, count, self._minimap.THUMB_SCALE,
+                batch_size=6, interval_ms=25, parent=self,
             )
-            self._minimap.load_document(self._viewer.page_count, thumbs)
+
+            def _on_batch(start: int, pixmaps: list) -> None:
+                mm = getattr(self, "_minimap", None)
+                if mm is None or not shiboken6.isValid(mm):
+                    return
+                for i, pix in enumerate(pixmaps):
+                    mm.set_thumbnail(start + i, pix)
+
+            gen.batch_ready.connect(_on_batch)
+            self._thumb_gen = gen
+            gen.start()
+
             self._position_minimap()
             # 监听滚动条变化（仅首次连接，避免重复）
             if not self._minimap_synced:
@@ -52,7 +92,17 @@ class _MinimapControllerMixin:
             # 立即初始化视口指示器（布局未完成时内部自动重试）
             self._update_minimap_viewport()
         except Exception:
-            logger.debug("Failed to generate thumbnails", exc_info=True)
+            logger.debug("Failed to setup minimap", exc_info=True)
+
+    def _stop_thumb_gen(self) -> None:
+        """停止并释放进行中的缩略图生成器。"""
+        gen = getattr(self, "_thumb_gen", None)
+        if gen is not None:
+            try:
+                gen.stop()
+            except RuntimeError:
+                pass
+            self._thumb_gen = None
 
     def _position_minimap(self) -> None:
         """将 minimap 定位到 viewer 右上角（并随高度重算面板与滚动范围）"""
