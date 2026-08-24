@@ -25,6 +25,8 @@ class DualRoughViewer(QWidget):
     translate_requested = Signal(str)
     rough_status = Signal(str)
     rough_ready = Signal()
+    rough_progress = Signal(int, int)
+    rough_stats = Signal(int, int)
     text_layer_ready = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -32,6 +34,12 @@ class DualRoughViewer(QWidget):
 
         self._left = PDFViewer(self)
         self._right = PDFViewer(self)
+
+        # 左右栏共享同一份会话存储：同文件只提取一次、只持有一份 QPdfDocument，
+        # 粗糙翻译状态（右栏写入）对两栏同时可见
+        shared: dict = {}
+        self._left.set_shared_sessions(shared)
+        self._right.set_shared_sessions(shared)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -53,6 +61,8 @@ class DualRoughViewer(QWidget):
             (self._right.translate_requested, self.translate_requested),
             (self._right.rough_status, self.rough_status),
             (self._right.rough_ready, self.rough_ready),
+            (self._right.rough_progress, self.rough_progress),
+            (self._right.rough_stats, self.rough_stats),
             (self._right.text_layer_ready, self.text_layer_ready),
         ):
             src.connect(dst)
@@ -187,6 +197,15 @@ class DualRoughViewer(QWidget):
 
     def rough_is_running(self) -> bool:
         return self._right.rough_is_running()
+
+    def rough_progress_counts(self) -> tuple[int, int]:
+        return self._right.rough_progress_counts()
+
+    def collect_rough_result(self) -> dict:
+        return self._right.collect_rough_result()
+
+    def apply_rough_translations(self, translations: dict) -> int:
+        return self._right.apply_rough_translations(translations)
 
     def set_cover_mode(self, mode: str) -> None:
         # 左栏始终原文透明层；右栏承载译文覆盖层

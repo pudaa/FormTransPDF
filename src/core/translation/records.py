@@ -29,10 +29,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 SIDECAR_SUFFIX = ".zh.srcinfo.json"
+
+# ── 粗糙翻译 sidecar ──────────────────────────────────────
+ROUGH_SIDECAR_SUFFIX = ".rough.json"
+_ROUGH_SIDECAR_VERSION = 1
 
 
 def compute_source_fingerprint(path: str | Path) -> tuple[str, str]:
@@ -116,3 +121,99 @@ def write_source_info(sidecar: Path, info: SourceInfo) -> None:
         encoding="utf-8",
     )
     tmp.replace(sidecar)
+
+
+# ═══════════════════════════════════════════════════════════
+# 粗糙翻译缓存（.rough.json）
+#
+# 与 BabelDOC 结果不同，粗译此前只存内存 —— 关闭应用即丢，重开同一 PDF
+# 要重新消耗 API。这里把译文按「源文件指纹」落盘到 output/rough_cache/：
+#   - 内容指纹优先（重命名/重保存稳定），字节指纹兜底；
+#   - 同时保存每段原文：加载时与当前分段逐段比对，分段算法升级导致
+#     失配的段自动跳过（不会错位注入）。
+# ═══════════════════════════════════════════════════════════
+
+
+def rough_cache_path(
+    output_dir: str | Path, content_hash: str, bytes_hash: str
+) -> Path:
+    """粗译缓存路径：output/rough_cache/<指纹前32位>.rough.json。"""
+    key = (content_hash or bytes_hash or "").strip()
+    if not key:
+        raise ValueError("指纹为空，无法定位粗译缓存")
+    return Path(output_dir) / "rough_cache" / f"{key[:32]}{ROUGH_SIDECAR_SUFFIX}"
+
+
+def save_rough_sidecar(
+    path: Path,
+    *,
+    source_hash: str,
+    bytes_hash: str,
+    lang_in: str,
+    lang_out: str,
+    translator: str,
+    model: str,
+    pages: dict,
+    source_name: str = "",
+    source_path: str = "",
+) -> None:
+    """原子写入粗糙翻译结果。
+
+    :param pages: {page: [(idx, 原文, 译文|None), ...]}（viewer.collect_rough_result）
+    :param source_name / source_path: 源文件名与绝对路径 —— 历史面板据此展示
+        「粗译」记录并支持点击重新打开源文件（按指纹自动命中缓存）。
+    """
+    payload = {
+        "version": _ROUGH_SIDECAR_VERSION,
+        "source_hash": source_hash,
+        "source_bytes_hash": bytes_hash,
+        "source_name": source_name,
+        "source_path": source_path,
+        "lang_in": lang_in,
+        "lang_out": lang_out,
+        "translator": translator,
+        "model": model,
+        "timestamp": time.time(),
+        "pages": {
+            str(pg): [{"i": idx, "src": src, "dst": dst} for (idx, src, dst) in rows]
+            for pg, rows in pages.items()
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_rough_sidecar(path: str | Path) -> dict | None:
+    """读取粗译缓存；缺失/损坏/版本不符返回 None（不抛异常）。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != _ROUGH_SIDECAR_VERSION:
+        return None
+    return data
+
+
+def rough_translations_from_sidecar(data: dict) -> dict[tuple[int, int], str]:
+    """从 sidecar 提取 {(page, idx): 译文}（丢弃空译文）。"""
+    out: dict[tuple[int, int], str] = {}
+    for pg_str, rows in (data.get("pages") or {}).items():
+        try:
+            pg = int(pg_str)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dst = row.get("dst")
+            if isinstance(dst, str) and dst.strip():
+                try:
+                    idx = int(row.get("i", -1))
+                except (TypeError, ValueError):
+                    continue
+                out[(pg, idx)] = dst
+    return out

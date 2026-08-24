@@ -22,7 +22,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.translation.records import SIDECAR_SUFFIX, read_source_info
+from src.core.translation.records import (
+    ROUGH_SIDECAR_SUFFIX,
+    SIDECAR_SUFFIX,
+    load_rough_sidecar,
+    read_source_info,
+)
 from src.ui.base.icon_factory import svg_icon, svg_pixmap
 from src.ui.base.theme import Colors, ThemeMode, _contrast_text, theme_manager
 
@@ -42,6 +47,9 @@ class HistoryEntry:
     dual_pdf: Path | None      # 双语对照
     csv_path: Path | None      # 词汇表
     timestamp: float            # 文件修改时间
+    # ── 粗译缓存记录（无 BabelDOC 结果 PDF，仅 .rough.json）──
+    is_rough: bool = False
+    rough_cache: Path | None = None
     source_hash: str = ""       # 源文件内容指纹（sidecar 提供；空=旧记录）
     source_bytes_hash: str = ""  # 源文件字节指纹（sidecar 提供）
     source_name: str = ""       # 原始源文件名（sidecar 提供）
@@ -95,6 +103,7 @@ class HistoryPanel(QWidget):
     """扫描 output/ 目录，以列表展示历史翻译记录，支持单个/批量删除"""
 
     result_selected = Signal(str, str, str, str)  # dual_path, mono_path, display_name, source_path
+    rough_selected = Signal(str)          # 粗译记录被点击 → 参数为源文件路径
     about_to_delete_files = Signal(list)  # 确认删除后、执行删除前发出将被删除的文件列表（供释放句柄）
 
     def __init__(self, output_dir: Path, parent: QWidget | None = None) -> None:
@@ -332,9 +341,46 @@ class HistoryPanel(QWidget):
                     if info.timestamp:
                         entries[base].timestamp = max(entries[base].timestamp, info.timestamp)
 
-        # 按时间降序排列
-        result = sorted(entries.values(), key=lambda e: e.timestamp, reverse=True)
+        # 按时间降序排列（含粗译缓存记录）
+        rough_entries = self._scan_rough_cache()
+        result = sorted(
+            list(entries.values()) + rough_entries,
+            key=lambda e: e.timestamp, reverse=True,
+        )
         return result
+
+    def _scan_rough_cache(self) -> list[HistoryEntry]:
+        """扫描 output/rough_cache/*.rough.json，生成「粗译」历史记录。
+
+        粗译没有结果 PDF —— 记录代表一份可复用的译文缓存：点击后重新打开
+        源文件，文本层就绪时按内容指纹自动命中缓存免翻译呈现。
+        """
+        results: list[HistoryEntry] = []
+        rough_dir = self._output_dir / "rough_cache"
+        if not rough_dir.exists():
+            return results
+        for f in sorted(rough_dir.glob(f"*{ROUGH_SIDECAR_SUFFIX}")):
+            data = load_rough_sidecar(f)
+            if not data:
+                continue
+            src_name = str(data.get("source_name") or "")
+            display = f"粗译 · {src_name}" if src_name else "粗译 · 未知名文档"
+            try:
+                ts = float(data.get("timestamp") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            results.append(HistoryEntry(
+                display_name=display,
+                pdf_path=None, mono_pdf=None, dual_pdf=None, csv_path=None,
+                timestamp=ts or f.stat().st_mtime,
+                source_hash=str(data.get("source_hash") or ""),
+                source_bytes_hash=str(data.get("source_bytes_hash") or ""),
+                source_name=src_name,
+                source_path=str(data.get("source_path") or ""),
+                is_rough=True,
+                rough_cache=f,
+            ))
+        return results
 
     def find_by_hash(self, source_hash: str, source_bytes_hash: str = "") -> HistoryEntry | None:
         """按源文件指纹查找已有翻译记录（优先 mono+dual 齐全的）。
@@ -345,6 +391,8 @@ class HistoryPanel(QWidget):
             return None
 
         def _matches(e: HistoryEntry) -> bool:
+            if e.is_rough:
+                return False  # 粗译缓存不是 BabelDOC 结果，不参与复用门控
             if source_bytes_hash and e.source_bytes_hash == source_bytes_hash:
                 return True
             if source_hash and e.source_hash == source_hash:
@@ -371,8 +419,9 @@ class HistoryPanel(QWidget):
         self._empty_label.setVisible(False)
         tp = theme_manager.palette
         for i, entry in enumerate(self._entries):
+            icon_name = "translate" if entry.is_rough else "document"
             item = QListWidgetItem(
-                svg_icon("document", tp.accent, 14), f"  {entry.display_name}"
+                svg_icon(icon_name, tp.accent, 14), f"  {entry.display_name}"
             )
             item.setData(Qt.ItemDataRole.UserRole, i)
             item.setToolTip(self._build_tooltip(entry))
@@ -394,6 +443,14 @@ class HistoryPanel(QWidget):
 
     @staticmethod
     def _build_tooltip(entry: HistoryEntry) -> str:
+        if entry.is_rough:
+            parts = [f"粗译译文缓存: {entry.rough_cache.name if entry.rough_cache else ''}"]
+            parts.append(f"源文件: {entry.source_name or '未知'}")
+            if entry.source_path:
+                parts.append("点击重新打开源文件（自动命中缓存免翻译）")
+            else:
+                parts.append("源文件路径未记录 — 请重新拖入同名 PDF 以命中缓存")
+            return "\n".join(p for p in parts if p)
         parts = [f"双栏: {entry.dual_pdf.name}" if entry.dual_pdf else ""]
         if entry.mono_pdf:
             parts.append(f"单栏: {entry.mono_pdf.name}")
@@ -420,6 +477,9 @@ class HistoryPanel(QWidget):
             self._update_delete_btn()
             return
 
+        if entry.is_rough:
+            self.rough_selected.emit(entry.source_path)
+            return
         idx = self._item_index(item)
         if idx is None or idx >= len(self._entries):
             return
@@ -548,8 +608,8 @@ class HistoryPanel(QWidget):
 
     @staticmethod
     def _entry_files(e: HistoryEntry) -> list[Path | None]:
-        """一条记录对应的全部文件（dual / mono / csv / sidecar）"""
-        return [e.dual_pdf, e.mono_pdf, e.csv_path, e.sidecar]
+        """一条记录对应的全部文件（dual / mono / csv / sidecar / 粗译缓存）"""
+        return [e.dual_pdf, e.mono_pdf, e.csv_path, e.sidecar, e.rough_cache]
 
     def _on_selection_changed(self) -> None:
         """选中变化：刷新选中项图标；浏览模式下同步删除按钮可用性"""

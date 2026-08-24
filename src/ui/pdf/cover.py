@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QRectF
@@ -50,6 +51,70 @@ _HEADING_SIZE_RATIO = 1.08
 _HEADING_ABS_PT_DIFF = 0.6
 # 同 block 内两行间垂直间隙若大于行高×该系数，视为新的逻辑段（视觉空行）
 _PARAGRAPH_GAP_RATIO = 1.4
+
+# ── 垃圾段过滤 ────────────────────────────────────────────
+# 目的：不把「不该翻译的东西」送进 LLM —— 纯数字/标点、公式碎片、参考文献
+# 条目、页眉页脚、arXiv 竖排水印。命中即整段丢弃：不送翻、不画白底，
+# 原文原样透出（公式/引用标记保持可读，这正是期望行为）。
+# 附带收益：这些垃圾段往往是"全宽/擦边假邻居"，过滤后碰撞计算明显变干净。
+_JUNK_TEXT_RE = re.compile(
+    r"^[\s\d\.\,\;\:\-\u2010-\u2015\(\)\[\]\{\}/\\|'\"`~!@#\$%\^&\*\+=<>\?"
+    r"°±×÷≈≠≤≥·•‹›«»§¶†‡‰µ∞∫∑∏√∂∇∈∉⊂⊃∪∩∀∃Å"
+    r"Ωαβγδεζηθικλμνξοπρστυφχψω"
+    r"ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ]*$"
+)
+# 参考文献条目："[1] Smith, J. ..." / "[12] ..."
+_REF_ENTRY_RE = re.compile(r"^\[\d{1,3}\]\s*\S")
+# 参考文献区标题（命中后本页其后所有段跳过）
+_REF_HEADING_SET = {"references", "bibliography", "works cited", "reference"}
+# 页眉/页脚带：距页顶/底该比例以内且足够矮的短段视为页眉页脚
+_MARGIN_BAND_RATIO = 0.055
+_MAX_BAND_SEG_H = 0.09      # 段高不超过页高的该比例（排除正文首行误伤）
+_MAX_BAND_TEXT_LEN = 130
+
+
+def is_junk_text(text: str) -> bool:
+    """判定是否为不值得翻译的垃圾文本（纯数字/符号/公式碎片/超短标记）。"""
+    t = (text or "").strip()
+    if not t or len(t) <= 2:
+        return True
+    if _JUNK_TEXT_RE.fullmatch(t):
+        return True
+    # 字母占比过低 → 公式/符号主导（如 "x2 +y2 = r2"、"Fig. 3(a)" 变体）
+    letters = sum(1 for c in t if c.isalpha())
+    if letters / len(t) < 0.35:
+        return True
+    return False
+
+
+def is_reference_entry(text: str) -> bool:
+    """判定是否为编号式参考文献条目（[n] Author ...）。"""
+    return bool(_REF_ENTRY_RE.match((text or "").strip()))
+
+
+def is_references_heading(text: str) -> bool:
+    """判定是否为 References/Bibliography 区标题。"""
+    t = (text or "").strip().lower().rstrip(":.").strip()
+    return t in _REF_HEADING_SET
+
+
+def _in_margin_band(seg: "CoverSegment", pw: float, ph: float) -> bool:
+    """判定段是否位于页眉/页脚带或竖排水印位置。
+
+    - 顶部/底部 _MARGIN_BAND_RATIO 带内、足够矮的短段 → 页眉/页脚；
+      （论文标题通常在 7% 以下才开始，不会被误伤）
+    - 极窄但极高的段（宽 < 5% 页宽 且 高 > 50% 页高）→ arXiv 类竖排水印。
+    """
+    y0, y1 = seg.pdf_y, seg.pdf_y + seg.pdf_height
+    short_enough = (
+        seg.pdf_height < ph * _MAX_BAND_SEG_H and len(seg.text) < _MAX_BAND_TEXT_LEN
+    )
+    if short_enough and (y1 < ph * _MARGIN_BAND_RATIO or y0 > ph * (1 - _MARGIN_BAND_RATIO)):
+        return True
+    x0, x1 = seg.pdf_x, seg.pdf_x + seg.pdf_width
+    if (x1 - x0) < pw * 0.05 and (y1 - y0) > ph * 0.5:
+        return True
+    return False
 
 
 @dataclass
@@ -114,12 +179,15 @@ def _first_word_has_hyphen(text: str) -> bool:
     return first.endswith(_HYPHENS) or any(h in first for h in _HYPHENS)
 
 
-def build_segments(spans: list) -> list[CoverSegment]:
+def build_segments(spans: list, page_size: tuple | None = None) -> list[CoverSegment]:
     """把一页的 span 聚合成段落级 segment（block → 行 → 连字符拼接 → 分块）。
 
     同 block 内进一步切分：
     - 首行字号明显大于其余行（中位数×1.15）→ 拆出标题段
     - 行间隙 > 1.4×行高 → 视为新的逻辑段
+    - 相邻行 x 范围基本错开 → 列流不连续处切分（跨栏合并 block 兜底）
+
+    :param page_size: (页宽, 页高) PDF 点单位；提供时启用页眉/页脚/竖排水印过滤
     """
     spans = [s for s in spans if s.text and s.text.strip()]
     if not spans:
@@ -127,6 +195,12 @@ def build_segments(spans: list) -> list[CoverSegment]:
 
     spans.sort(key=lambda s: (getattr(s, "block_id", 0), s.pdf_y, s.pdf_x))
 
+    pw: float | None = None
+    ph: float | None = None
+    if page_size and len(page_size) == 2:
+        pw, ph = float(page_size[0]), float(page_size[1])
+
+    in_refs = False  # 命中 References 标题后，本页其后所有段跳过
     segments: list[CoverSegment] = []
     for _block_id, block_spans in itertools.groupby(
         spans, key=lambda s: getattr(s, "block_id", 0)
@@ -134,7 +208,7 @@ def build_segments(spans: list) -> list[CoverSegment]:
         block_lines = _build_lines(list(block_spans))
         if not block_lines:
             continue
-        # 同 block 内按"标题/正文" + "行间隙" 切子段
+        # 同 block 内按"标题/正文" + "行间隙" + "列流不连续" 切子段
         sub_ranges = _split_block_lines(block_lines)
         for sr_idx, (s_idx, e_idx) in enumerate(sub_ranges):
             sub_lines = block_lines[s_idx:e_idx]
@@ -148,6 +222,16 @@ def build_segments(spans: list) -> list[CoverSegment]:
                 text = " ".join(p[0] for p in pieces[s:e])
                 seg = _segment_from_lines(chunk_lines, text)
                 seg.is_heading = is_heading
+                # ── 垃圾段过滤：命中即丢弃（原文透出，不送翻不覆盖）──
+                if is_junk_text(seg.text):
+                    continue
+                if is_references_heading(seg.text):
+                    in_refs = True
+                    continue
+                if in_refs or is_reference_entry(seg.text):
+                    continue
+                if pw is not None and ph is not None and _in_margin_band(seg, pw, ph):
+                    continue
                 segments.append(seg)
     return segments
 
@@ -159,6 +243,10 @@ def _split_block_lines(lines: list[_LineInfo]) -> list[tuple[int, int]]:
     1. 标题检测：若首行字号 > 中位字号 × _HEADING_SIZE_RATIO，前 1（或首两行连续）
        作为标题段，其余作为正文段。
     2. 段落间隙：两行顶部间距 > max(两行高) × _PARAGRAPH_GAP_RATIO → 在该处切分。
+    3. 列流不连续：相邻两行 x 范围基本错开（重叠 < 30% 且水平间隙明显）→ 切分。
+       PyMuPDF 偶尔把左右栏文字合进同一 block —— 不切断则段 bbox 横跨两栏，
+       译文会横穿栏沟、白底盖住邻栏文字，且该"全宽假段"会成为上方所有段的
+       下方碰撞边界，把邻段可用高度压碎 → 过度缩字。此规则为根因兜底。
     """
     n = len(lines)
     if n == 0:
@@ -180,12 +268,19 @@ def _split_block_lines(lines: list[_LineInfo]) -> list[tuple[int, int]]:
     for i in range(1, n):
         prev = lines[i - 1]
         cur = lines[i]
-        gap = cur.y0 - (prev.y0 + prev.y1 - prev.y0)  # = cur.y0 - prev.y1
-        # prev.y1 is bottom = y0 + height
-        gap = cur.y0 - (prev.y0 + (prev.y1 - prev.y0))
         gap = cur.y0 - prev.y1
         max_h = max(prev.y1 - prev.y0, cur.y1 - cur.y0)
         if gap > max_h * _PARAGRAPH_GAP_RATIO:
+            cut_after.add(i - 1)
+
+    # 规则 3：列流不连续处切分（跨栏合并 block 兜底，见 docstring）
+    for i in range(1, n):
+        prev, cur = lines[i - 1], lines[i]
+        ovl = min(prev.x1, cur.x1) - max(prev.x0, cur.x0)
+        min_w = min(prev.x1 - prev.x0, cur.x1 - cur.x0)
+        gap_x = max(prev.x0, cur.x0) - min(prev.x1, cur.x1)
+        fs = max(1.0, min(prev.font_size, cur.font_size))
+        if min_w > 0 and ovl <= 0.3 * min_w and gap_x > _COLUMN_GAP_TOLERANCE * fs:
             cut_after.add(i - 1)
 
     # 收集区间

@@ -10,6 +10,7 @@ PDF 文本覆盖层 — 覆盖在 QPdfView viewport 上的透明层。
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import List, Optional
 
 from PySide6.QtWidgets import (
@@ -18,7 +19,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, QTimer, QPropertyAnimation
 from PySide6.QtGui import (
-    QPainter, QColor, QFont, QTextDocument, QTextLayout, QTextOption, QPixmap,
+    QPainter, QColor, QFont, QFontDatabase, QTextDocument, QTextLayout,
+    QTextOption, QPixmap,
 )
 
 from src.ui.base.icon_factory import svg_icon
@@ -33,8 +35,13 @@ _COVER_PAD = 2.0                   # 白底每侧外扩像素（覆盖原文抗�
 # 碰撞时允许缩小，但绝不低于 _FIT_MIN_FONT_PX（避免缩到蚂蚁大小不可读）。
 _COVER_MIN_FONT_PX = 6.5
 # 自适应字号下限：碰撞挤压时译文最多缩到该像素大小，低于此宁可轻微溢出/裁切。
-_FIT_MIN_FONT_PX = 9.0
-_COVER_CACHE_LIMIT = 24            # 页 pixmap 缓存上限（超出全清）
+# （9 → 10：实测 9px 在 100% 缩放下已接近不可读；配合碰撞误判修复，
+#  正常段落极少触底）
+_FIT_MIN_FONT_PX = 10.0
+_COVER_CACHE_LIMIT = 24            # 页 pixmap 缓存上限（LRU 淘汰，不再全清）
+# 单页 pixmap 像素上限（约 96MB RGBA）：极端缩放（8×+HiDPI）下整页可达数百 MB，
+# 超限按比例降低内部分辨率渲染（视觉轻微变糊 vs 内存尖峰/OOM）
+_PIXMAP_MAX_PIXELS = 24_000_000
 # CJK 字形填满 em 方框，同 pt 下视觉比拉丁大 ~15%，故乘以 0.85 让译文与原 PDF 视觉等高
 _CJK_VISUAL_SCALE = 0.85
 # 段落之间的最小间距（像素），白底向下扩张到此即截断，避免压到下一段
@@ -59,6 +66,41 @@ def _has_cjk(text: str) -> bool:
     return False
 
 
+# ── 字体回退链（QFontDatabase 运行时探测，替代硬编码平台判断）──
+_FONT_FAMILY_CACHE: dict[str, str] = {}
+
+
+def _first_available_family(candidates: list[str]) -> str:
+    """返回系统中第一个实际安装的字体族；全缺时回退末项（由 Qt 自行兜底）。"""
+    key = "|".join(candidates)
+    if key not in _FONT_FAMILY_CACHE:
+        try:
+            available = set(QFontDatabase.families())
+        except Exception:
+            available = set()
+        _FONT_FAMILY_CACHE[key] = next(
+            (f for f in candidates if f in available), candidates[-1]
+        )
+    return _FONT_FAMILY_CACHE[key]
+
+
+def _cjk_font_family() -> str:
+    return _first_available_family([
+        "Microsoft YaHei UI",   # Windows
+        "PingFang SC",          # macOS
+        "Noto Sans CJK SC",     # Linux 主流发行版
+        "WenQuanYi Zen Hei",    # Linux 老发行版兜底
+    ])
+
+
+def _latin_font_family() -> str:
+    return _first_available_family([
+        "Segoe UI",             # Windows
+        "Helvetica Neue",       # macOS
+        "DejaVu Sans",          # Linux
+    ])
+
+
 def _cover_font(text: str, pixel_size: float) -> QFont:
     """按文本语言选择字体并调整像素尺寸。
 
@@ -66,7 +108,7 @@ def _cover_font(text: str, pixel_size: float) -> QFont:
     因此对 CJK 文本乘以 _CJK_VISUAL_SCALE，使译文在视觉上贴合原 PDF 文字大小。
     像素尺寸公式：font_pt × layout_scale（与 PDF 渲染同坐标系，逐 pt 换算）。
     """
-    family = "Microsoft YaHei UI" if _has_cjk(text) else "Segoe UI"
+    family = _cjk_font_family() if _has_cjk(text) else _latin_font_family()
     size = pixel_size * (_CJK_VISUAL_SCALE if _has_cjk(text) else 1.0)
     font = QFont(family)
     font.setPixelSize(max(1, int(round(size))))
@@ -95,8 +137,11 @@ class TextOverlay(QWidget):
         self._cover_mode: str = COVER_TRANSPARENT
         self._cover_pages: dict = {}       # page -> [CoverSegment]（content 坐标已就绪）
         self._cover_layouts: dict = {}     # page -> PageLayout
-        self._cover_version: int = 0       # 数据/模式版本，变更时重建页缓存
-        self._cover_cache: dict = {}       # (page, scale_key, version) -> QPixmap
+        # 双层版本号：全局版本（模式切换）+ 页级版本（流式增量只失效脏页）
+        self._global_version: int = 0
+        self._page_versions: dict[int, int] = {}
+        # LRU 页缓存：(page, scale_key, global_v, page_v) -> QPixmap
+        self._cover_cache: OrderedDict = OrderedDict()
 
         # ── 浮动工具栏 ──
         # 父级必须是 viewport（而非本透明层）：WA_TransparentForMouseEvents 会使其
@@ -177,36 +222,53 @@ class TextOverlay(QWidget):
         if mode == self._cover_mode:
             return
         self._cover_mode = mode
-        self._cover_version += 1
-        self._cover_cache.clear()
+        self._bump_cache(None)
         self.update()
+
+    def _bump_cache(self, pages: set[int] | None) -> None:
+        """失效页缓存：pages=None 全部；否则仅指定页（页级版本+1 并剔除旧项）。
+
+        流式翻译期间每 150ms 防抖刷新只 bump 收到译文的页 —— 其余页缓存
+        原样保留，不再整页重渲染（旧实现全清导致的卡顿根因之一）。
+        """
+        if pages is None:
+            self._global_version += 1
+            self._page_versions.clear()
+            self._cover_cache.clear()
+            return
+        for pg in pages:
+            self._page_versions[pg] = self._page_versions.get(pg, 0) + 1
+        for key in [k for k in self._cover_cache if k[0] in pages]:
+            self._cover_cache.pop(key, None)
 
     def set_cover(
         self,
         pages: dict,
         layouts: dict,
         bump: bool = False,
+        bump_pages: set[int] | None = None,
     ) -> None:
         """设置覆盖层数据。
 
-        :param pages:   page -> [CoverSegment]（content_rect 已由 viewer 计算）
-        :param layouts: page -> PageLayout（页矩形与缩放）
-        :param bump:    数据内容变化（译文到位/模式切换）时置 True，重建页缓存；
-                        仅滚动等视口变化时置 False，避免缓存抖动。
+        :param pages:      page -> [CoverSegment]（content_rect 已由 viewer 计算）
+        :param layouts:    page -> PageLayout（页矩形与缩放）
+        :param bump:       True = 全量失效（模式切换/完成）；与 bump_pages 二选一
+        :param bump_pages: 仅这些页数据变化（流式增量）；空集合 = 仅同步引用
         """
         self._cover_pages = pages or {}
         self._cover_layouts = layouts or {}
-        if bump:
-            self._cover_version += 1
-            self._cover_cache.clear()
+        if bump_pages is not None:
+            if bump_pages:
+                self._bump_cache(bump_pages)
+        elif bump:
+            self._bump_cache(None)
         self.update()
 
     def clear_cover(self) -> None:
         self._cover_pages = {}
         self._cover_layouts = {}
         self._cover_mode = COVER_TRANSPARENT
-        self._cover_version += 1
-        self._cover_cache.clear()
+        self._bump_cache(None)
         self.update()
 
     # ── 覆盖层绘制 ─────────────────────────────────────────
@@ -246,15 +308,21 @@ class TextOverlay(QWidget):
                 continue
 
             scale_key = int(layout.scale * 100)
-            key = (page, scale_key, self._cover_version)
+            key = (
+                page, scale_key, self._global_version,
+                self._page_versions.get(page, 0),
+            )
             pix = self._cover_cache.get(key)
             if pix is None:
                 pix = self._render_page_pixmap(page, layout, segs)
                 if pix is None or pix.isNull():
                     continue
                 self._cover_cache[key] = pix
-                if len(self._cover_cache) > _COVER_CACHE_LIMIT:
-                    self._cover_cache.clear()
+                # LRU 淘汰最旧（旧实现超限全清 → 连续缩放时反复全量重渲染）
+                while len(self._cover_cache) > _COVER_CACHE_LIMIT:
+                    self._cover_cache.popitem(last=False)
+            else:
+                self._cover_cache.move_to_end(key)
 
             painter.drawPixmap(page_vp.topLeft(), pix)
 
@@ -283,8 +351,12 @@ class TextOverlay(QWidget):
                 br = b.content_rect
                 if br.y() <= r.y() + 1:
                     continue
-                # x 重叠判定（2px 容差）：保证白底向下扩张只在「同段所在视觉列」
-                if br.right() > r.left() + 2 and br.left() < r.right() - 2:
+                # x 重叠判定：要求有效重叠宽度 ≥ **本段自身宽度**的 25%（仅数像素
+                # 的擦边接触不算 —— 上下标/公式编号/栏沟毛边曾把本段可用高度压到
+                # 极限，触发过度缩字）。基准取本段而非较窄者：避免"极窄碎段搭在
+                # 本段边缘"时按窄段比例凑数通过。
+                ovl = min(br.right(), r.right()) - max(br.left(), r.left())
+                if ovl > 2 and ovl >= 0.25 * r.width():
                     below_y.append(br.y())
             next_y_by_seg[id(seg)] = (
                 min(below_y) - _SEG_GAP if below_y else page_bottom
@@ -314,9 +386,12 @@ class TextOverlay(QWidget):
                 if b is seg:
                     continue
                 br = b.content_rect
-                # 在右侧（左边缘 ≥ 本段右边缘 − 2px 容差）且 y 范围重叠（±1px 容差）
+                # 在右侧（左边缘 ≥ 本段右边缘 − 2px 容差）且 y 范围有**有效重叠**
+                # （≥ 本段自身高度的 15% 且 > 2px）：斜向擦边的单像素接触不再收窄
+                # 本段行宽，避免"横向剩余空间没用完就缩字"。
                 if br.left() >= r.right() - 2:
-                    if br.top() < r.bottom() - 1 and br.bottom() > r.top() + 1:
+                    y_ovl = min(br.bottom(), r.bottom()) - max(br.top(), r.top())
+                    if y_ovl > 2 and y_ovl >= 0.15 * r.height():
                         if br.left() < right_bound:
                             right_bound = br.left()
             next_x_by_seg[id(seg)] = right_bound - _SEG_GAP
@@ -417,6 +492,12 @@ class TextOverlay(QWidget):
         h = max(1, int(round(layout.rect.height())))
         dpr = self.devicePixelRatioF() or 1.0
 
+        # 像素帽：极端缩放（8×+HiDPI）下整页 RGBA 可达数百 MB —— 超限按比例
+        # 降低内部分辨率（视觉轻微变糊，换取内存安全）
+        total_px = float(w) * float(h) * dpr * dpr
+        if total_px > _PIXMAP_MAX_PIXELS:
+            dpr *= (_PIXMAP_MAX_PIXELS / total_px) ** 0.5
+
         pix = QPixmap(int(round(w * dpr)), int(round(h * dpr)))
         pix.setDevicePixelRatio(dpr)
         pix.fill(Qt.GlobalColor.transparent)
@@ -430,14 +511,15 @@ class TextOverlay(QWidget):
         # ── 每段的横向可用右边界（横向碰撞：右侧 y 重叠段 / 页边）──
         next_x_by_seg = self._compute_next_x(segs, float(w), origin)
 
-        # 绘制顺序：普通段按 (y, x) 升序（上方先画）；**被拖拽偏移的浮动段最后画**，
-        # 浮在最上层 —— 拖出来的字块不被其他段的白底盖住。
+        # 绘制顺序：普通段按 (y, x) 升序（上方先画）；**被拖拽偏移的浮动段排序值
+        # 更大 → 排在最后绘制，浮在其他段白底之上** —— 拖出来的字块不被盖住。
+        # （旧代码键值写反：floating=0 排最前 → 最先画 → 反被普通段覆盖）
         def _float_key(s) -> tuple:
             floating = (
                 getattr(s, "offset_x", 0.0) != 0.0
                 or getattr(s, "offset_y", 0.0) != 0.0
             )
-            return (0 if floating else 1, s.content_rect.y(), s.content_rect.x())
+            return (1 if floating else 0, s.content_rect.y(), s.content_rect.x())
 
         ordered_segs = sorted(
             [s for s in segs if s.content_rect and not s.content_rect.isEmpty()],

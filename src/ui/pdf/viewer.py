@@ -68,11 +68,15 @@ class PDFViewerCore(QWidget):
     translate_requested = Signal(str)    # 浮动工具栏「翻译」→ 主窗口即时翻译
     rough_status = Signal(str)           # 粗糙翻译状态（进度/完成/异常）
     rough_ready = Signal()               # 粗糙翻译全部完成
+    rough_progress = Signal(int, int)    # 粗糙翻译进度（done, total，含最终失败段）
+    rough_stats = Signal(int, int)       # 粗糙翻译结束统计（成功段数, 失败段数）
     text_layer_ready = Signal()          # 后台文本提取完成（文本层就绪）
 
     DEFAULT_SCALE = 1.0
     MIN_SCALE = 0.25
     MAX_SCALE = 8.0
+    # 会话缓存上限（超出按插入序淘汰最旧；当前会话不淘汰）
+    MAX_SESSIONS = 6
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -129,6 +133,7 @@ class PDFViewerCore(QWidget):
 
         # ── 粗糙翻译（覆盖层）状态 ──
         self._sessions: dict[str, dict] = {}   # path -> 文档会话（doc+spans+segments+译态）
+        self._shared_store: dict | None = None  # 双栏共享会话存储（非 None 时 _sessions 即它）
         self._session: dict | None = None      # 当前激活会话
         self._source_path: str | None = None
         self._cover_segments: dict[int, list] = {}   # page -> [CoverSegment]
@@ -139,6 +144,8 @@ class PDFViewerCore(QWidget):
         self._rough = RoughTranslator(self)
         self._rough.segment_done.connect(self._on_rough_segment)
         self._rough.page_done.connect(self._on_rough_page)
+        self._rough.progress.connect(self._on_rough_progress)
+        self._rough.stats.connect(self._on_rough_stats)
         self._rough.finished.connect(self._on_rough_finished)
         self._rough.failed.connect(self._on_rough_failed)
         # 译文到位时合并重绘（150ms 防抖，避免逐块清空页缓存）
@@ -146,6 +153,9 @@ class PDFViewerCore(QWidget):
         self._cover_debounce.setSingleShot(True)
         self._cover_debounce.setInterval(150)
         self._cover_debounce.timeout.connect(self._flush_cover)
+        # 流式期间收到译文的脏页累积器：防抖到期只重建这些页的缓存；
+        # None 表示「全量刷新」（模式切换/完成时）
+        self._pending_dirty: set[int] | None = None
 
         # ── 字块拖拽（复杂布局下把被遮盖的段拖出来查看）──
         # Alt+左键拖拽命中段 → 段整体平移（offset_x/y），松开保持，双击复位。
@@ -264,6 +274,18 @@ class PDFViewerCore(QWidget):
             if k not in self._sessions:
                 self._sessions[k] = v
 
+    def set_shared_sessions(self, store: dict) -> None:
+        """用外部共享存储替换本实例的会话缓存。
+
+        双栏查看器让左右栏指向同一个 dict：任一栏 load_pdf 新建的会话
+        对另一栏立即可见 —— 消灭同文件双重提取/双份 QPdfDocument。
+        必须在本实例尚未持有任何会话时调用。
+        """
+        if store is None or self._sessions:
+            return
+        self._sessions = store
+        self._shared_store = store
+
     def export_sessions(self) -> dict:
         """导出当前文档会话缓存（供重建后的新 viewer 复用）。"""
         out = dict(self._sessions)
@@ -318,8 +340,11 @@ class PDFViewerCore(QWidget):
             "segments": self._cover_segments,
             "translations": self._rough_translations,
             "extraction_complete": False,
+            # 提取进行中标记：双栏共享会话时，另一栏据此不再重复起提取任务
+            "extracting": True,
         }
         self._sessions[path] = self._session
+        self._evict_sessions(self.MAX_SESSIONS)
 
         self._layout_engine.set_document(self._doc)
         self._fit_width = True
@@ -371,9 +396,12 @@ class PDFViewerCore(QWidget):
         self._text_overlay.show()
         self._text_overlay.raise_()
 
-        # 会话提取若被中途打断（切走时取消），恢复时补跑（已在跑则跳过）
-        if not session.get("extraction_complete") and not self._text_extractor.is_active(self._doc_id):
-            self._text_extractor.extract(session["path"], self._doc_id)
+        # 会话提取若被中途打断（切走时取消），恢复时补跑；
+        # 共享会话下另一栏正在提取（extracting=True）则不重复起任务
+        if not session.get("extraction_complete") and not session.get("extracting"):
+            if not self._text_extractor.is_active(self._doc_id):
+                session["extracting"] = True
+                self._text_extractor.extract(session["path"], self._doc_id)
 
         self._on_viewport_changed()
 
@@ -411,30 +439,47 @@ class PDFViewerCore(QWidget):
                 key_resolved = str(Path(key).resolve())
             except Exception:
                 key_resolved = key
-            if key_resolved not in targets:
+            if key_resolved in targets:
+                self._teardown_session(key)
+
+    def _teardown_session(self, key: str) -> None:
+        """弹出并销毁单个会话（若正是当前显示文档则先卸载全部引用）。"""
+        session = self._sessions.pop(key, None)
+        if session is None:
+            return
+        doc = session.get("doc")
+        if doc is None:
+            return
+        try:
+            if not shiboken6.isValid(doc):
+                return
+        except RuntimeError:
+            return
+        if self._doc is doc:
+            self._rough.cancel()
+            self._text_extractor.cancel()
+            self._pdf_view.setDocument(None)
+            self._layout_engine.set_document(None)
+            self._doc = None
+            self._session = None
+            self._stack.setCurrentIndex(0)
+        try:
+            shiboken6.delete(doc)  # 立即析构 → 归还文件句柄
+        except Exception:
+            logger.debug("Failed to delete QPdfDocument for %s", key, exc_info=True)
+
+    def _evict_sessions(self, max_keep: int) -> None:
+        """按插入序淘汰最旧会话（跳过当前会话），防止长会话内存无界增长。"""
+        overflow = len(self._sessions) - max_keep
+        if overflow <= 0:
+            return
+        for key in list(self._sessions.keys()):
+            if overflow <= 0:
+                break
+            if self._sessions.get(key) is self._session:
                 continue
-            session = self._sessions.pop(key)
-            doc = session.get("doc")
-            if doc is None:
-                continue
-            try:
-                if not shiboken6.isValid(doc):
-                    continue
-            except RuntimeError:
-                continue
-            # 若正是当前显示文档，先卸载所有持有该 doc 的引用
-            if self._doc is doc:
-                self._rough.cancel()
-                self._text_extractor.cancel()
-                self._pdf_view.setDocument(None)
-                self._layout_engine.set_document(None)
-                self._doc = None
-                self._session = None
-                self._stack.setCurrentIndex(0)
-            try:
-                shiboken6.delete(doc)  # 立即析构 → 归还文件句柄
-            except Exception:
-                logger.debug("Failed to delete QPdfDocument for %s", key, exc_info=True)
+            self._teardown_session(key)
+            overflow -= 1
 
     def shutdown(self) -> None:
         """窗口关闭前调用：断开视口跟踪信号、取消后台任务、卸载文档。
@@ -448,7 +493,18 @@ class PDFViewerCore(QWidget):
         self._doc_id += 1
         self._text_extractor.cancel()
         self._text_spans.clear()
-        self._sessions.clear()
+        # 共享会话下另一栏可能还要补跑提取：解除本实例的"提取中"占位
+        if self._session is not None:
+            try:
+                if not self._session.get("extraction_complete"):
+                    self._session["extracting"] = False
+            except RuntimeError:
+                pass
+        if getattr(self, "_shared_store", None) is None:
+            self._sessions.clear()
+        else:
+            # 共享存储归 DualRoughViewer 所有：仅脱离引用，不清空内容
+            self._sessions = {}
         try:
             if shiboken6.isValid(self._pdf_view):
                 self._pdf_view.setDocument(None)
@@ -670,7 +726,7 @@ class PDFViewerCore(QWidget):
         if self._rough.is_running:
             self._rough.cancel()
         all_segments = [
-            (pg, idx, seg.text)
+            (pg, idx, seg.text, bool(seg.is_heading))
             for pg in sorted(self._cover_segments)
             for idx, seg in enumerate(self._cover_segments[pg])
             if seg.text.strip()
@@ -679,8 +735,8 @@ class PDFViewerCore(QWidget):
             return False
         # 续传：跳过已翻译的段（(pg, idx) 在 translations 中已有译文）
         pending = [
-            (pg, idx, t) for pg, idx, t in all_segments
-            if (pg, idx) not in self._rough_translations
+            item for item in all_segments
+            if (item[0], item[1]) not in self._rough_translations
         ]
         reused = len(all_segments) - len(pending)
         if not pending:
@@ -692,6 +748,8 @@ class PDFViewerCore(QWidget):
             return True
         self._rough.start(self._doc_id, pending, profile, lang_in, lang_out)
         self.set_cover_mode(COVER_TRANSLATED)
+        # 初始进度：调用方（主窗口）据此初始化进度条量程
+        self.rough_progress.emit(0, len(pending))
         suffix = f"（{reused} 个已译复用）" if reused else ""
         self.rough_status.emit(
             f"粗糙翻译启动：{len(pending)} 个文本块待译{suffix}，按页流式呈现…"
@@ -700,6 +758,53 @@ class PDFViewerCore(QWidget):
 
     def cancel_rough_translation(self) -> None:
         self._rough.cancel()
+
+    # ── 粗译持久化（与 main_window 的 sidecar 读写配合）──────
+
+    def collect_rough_result(self) -> dict[int, list[tuple[int, str, str | None]]]:
+        """导出 {page: [(idx, 原文, 译文|None), ...]}，供 sidecar 持久化。"""
+        out: dict[int, list[tuple[int, str, str | None]]] = {}
+        for pg in sorted(self._cover_segments):
+            rows = []
+            for idx, seg in enumerate(self._cover_segments[pg]):
+                if not seg.text.strip():
+                    continue
+                rows.append((idx, seg.text, self._rough_translations.get((pg, idx))))
+            if rows:
+                out[pg] = rows
+        return out
+
+    def apply_rough_translations(self, translations: dict) -> int:
+        """注入历史粗译（仅接受当前分段中存在的 (page, idx) 键），返回采纳数。"""
+        applied = 0
+        pages: set[int] = set()
+        for key, dst in (translations or {}).items():
+            if not isinstance(key, tuple) or len(key) != 2:
+                continue
+            pg, idx = key
+            segs = self._cover_segments.get(pg)
+            if not segs or not (0 <= idx < len(segs)):
+                continue
+            if isinstance(dst, str) and dst.strip():
+                self._rough_translations[(pg, idx)] = dst
+                pages.add(pg)
+                applied += 1
+        if applied and self._cover_mode == COVER_TRANSLATED:
+            self._schedule_flush(pages, immediate=True)
+        return applied
+
+    def rough_progress_counts(self) -> tuple[int, int]:
+        """(已译段数, 总段数) — 供「点击继续翻译（已有 N/M 段）」提示使用。
+
+        已译数只统计当前分段中仍然有效的键（分段算法升级后旧键自动失效）。
+        """
+        total = self.rough_segment_count()
+        done = sum(
+            1
+            for (pg, idx) in self._rough_translations
+            if pg in self._cover_segments and 0 <= idx < len(self._cover_segments[pg])
+        )
+        return done, total
 
     def _update_page_cover(self, layout: PageLayout):
         """将单页 CoverSegment 的 PDF 坐标转换为内容坐标"""
@@ -721,8 +826,14 @@ class PDFViewerCore(QWidget):
                     self._rough_translations.get((pg, idx)) if translated else None
                 )
 
-    def _push_cover(self, bump: bool = False) -> None:
-        """把覆盖层数据推给 TextOverlay（bump=True 表示内容变化需重建页缓存）。"""
+    def _push_cover(
+        self, bump: bool = False, dirty_pages: set[int] | None = None
+    ) -> None:
+        """把覆盖层数据推给 TextOverlay。
+
+        :param bump: 内容/模式变化需重建页缓存
+        :param dirty_pages: 仅这些页数据变化（流式增量）；None = 全部页
+        """
         if not self._doc_is_valid():
             return
         if self._cover_mode != COVER_TRANSPARENT:
@@ -731,12 +842,28 @@ class PDFViewerCore(QWidget):
             self._cover_segments,
             {l.page_num: l for l in self._last_layouts},
             bump=bump,
+            bump_pages=dirty_pages,
         )
 
-    def _flush_cover(self) -> None:
+    def _schedule_flush(self, pages: set[int], immediate: bool = False) -> None:
+        """累积脏页并调度合并重绘；immediate=True 跳过防抖立即刷新。"""
+        if self._pending_dirty is not None:
+            self._pending_dirty |= pages
+        if immediate:
+            self._flush_cover()
+        else:
+            self._cover_debounce.start()
+
+    def _flush_cover(self, all_pages: bool = False) -> None:
+        """把累积的脏页（或全部页）推给覆盖层重建页缓存。"""
         if self._cover_debounce.isActive():
             self._cover_debounce.stop()
-        self._push_cover(bump=True)
+        if all_pages:
+            self._pending_dirty = None
+        dirty = self._pending_dirty
+        self._pending_dirty = set()
+        # dirty=None → 全量；空集合 → 仅同步引用不失效缓存
+        self._push_cover(bump=True, dirty_pages=dirty)
 
     def cover_segment_at(self, vp_pos) -> "CoverSegment | None":
         """命中测试：返回 viewport 坐标处（偏移后位置）命中的 cover segment。
@@ -765,19 +892,29 @@ class PDFViewerCore(QWidget):
             return
         self._rough_translations[(page, idx)] = text
         if self._cover_mode != COVER_TRANSPARENT:
-            self._cover_debounce.start()  # 防抖合并逐块重绘
+            self._schedule_flush({page})  # 防抖合并逐块重绘（仅脏页）
 
     def _on_rough_page(self, doc_id: int, page: int) -> None:
         if doc_id != self._doc_id:
             return
-        self._flush_cover()
+        self._schedule_flush({page}, immediate=True)
         self.rough_status.emit(f"粗糙翻译：第 {page + 1} 页完成")
+
+    def _on_rough_progress(self, doc_id: int, done: int, total: int) -> None:
+        if doc_id != self._doc_id:
+            return
+        self.rough_progress.emit(done, total)
+
+    def _on_rough_stats(self, doc_id: int, ok: int, failed: int) -> None:
+        if doc_id != self._doc_id:
+            return
+        self.rough_stats.emit(ok, failed)
 
     def _on_rough_finished(self, doc_id: int) -> None:
         if doc_id != self._doc_id:
             return
-        self._flush_cover()
-        self.rough_status.emit("粗糙翻译完成")
+        self._flush_cover(all_pages=True)
+        # 完成文案由 rough_stats 的接收方负责（含成败明细），这里只同步状态
         self.rough_ready.emit()
 
     def _on_rough_failed(self, doc_id: int, message: str) -> None:
@@ -804,13 +941,13 @@ class PDFViewerCore(QWidget):
         h_diff = abs(our_height - qpdf_height)
         w_diff = abs(max_w - qpdf_width)
         if h_diff > 50 or w_diff > 50:
-            print(
-                f"[Layout 诊断] scale={self._current_scale():.3f} fit_width={self._fit_width} "
-                f"vp=({vp.width()},{vp.height()}) "
-                f"我们的 content=({max_w:.0f},{our_height:.0f}) "
-                f"QPdfView content=({qpdf_width:.0f},{qpdf_height:.0f}) "
-                f"差异=({w_diff:.0f},{h_diff:.0f}) "
-                f"margins=({margins.left()},{margins.top()},{margins.right()},{margins.bottom()})"
+            logger.debug(
+                "[Layout 诊断] scale=%.3f fit_width=%s vp=(%s,%s) "
+                "我们的 content=(%.0f,%.0f) QPdfView content=(%.0f,%.0f) "
+                "差异=(%.0f,%.0f) margins=(%s,%s,%s,%s)",
+                self._current_scale(), self._fit_width, vp.width(), vp.height(),
+                max_w, our_height, qpdf_width, qpdf_height, w_diff, h_diff,
+                margins.left(), margins.top(), margins.right(), margins.bottom(),
             )
 
     def _sync_overlay_geometry(self):
@@ -829,7 +966,16 @@ class PDFViewerCore(QWidget):
             return  # 丢弃过期结果
 
         self._text_spans[page_num] = spans
-        self._cover_segments[page_num] = build_segments(spans)
+        # 页尺寸用于垃圾段过滤（页眉/页脚带、竖排水印判定）
+        page_size = None
+        doc = self._doc
+        if doc is not None:
+            try:
+                pt = doc.pagePointSize(page_num)
+                page_size = (pt.width(), pt.height())
+            except Exception:
+                page_size = None
+        self._cover_segments[page_num] = build_segments(spans, page_size=page_size)
 
         # 立即计算该页坐标（如果布局已就绪）
         self._on_viewport_changed()
@@ -839,7 +985,8 @@ class PDFViewerCore(QWidget):
             self._text_layer_done = True
             if self._session is not None and self._session["doc_id"] == doc_id:
                 self._session["extraction_complete"] = True
-            print(f"PDF 文本提取完成，共 {len(self._text_spans)} 页")
+                self._session["extracting"] = False
+            logger.info("PDF 文本提取完成，共 %d 页", len(self._text_spans))
             self.text_layer_ready.emit()
 
     # ── resizeEvent ─────────────────────────────────────────

@@ -40,7 +40,13 @@ from PySide6.QtWidgets import (
 
 from src.core.signals import TranslationSignals
 from src.core.translation.engine import TranslationEngine
-from src.core.translation.records import compute_source_fingerprint
+from src.core.translation.records import (
+    compute_source_fingerprint,
+    load_rough_sidecar,
+    rough_cache_path,
+    rough_translations_from_sidecar,
+    save_rough_sidecar,
+)
 from src.ui.base.icon_factory import IconHoverFilter, accent_icon, svg_icon
 from src.ui.base.theme import ThemePalette, theme_manager, _contrast_text
 from src.ui.dialogs.quick_translate import QuickTranslateDialog
@@ -195,9 +201,16 @@ class MainWindow(
         return theme_manager.palette
 
     def _create_viewer(self):
-        """按「粗糙布局」配置创建查看器：双栏（DualRoughViewer）或单栏（PDFViewer）。"""
-        layout_mode = str(self._app_settings.value("rough_layout", "mono") or "mono")
-        if layout_mode == "dual":
+        """按「输出模式」配置创建查看器：双语对照→双栏（DualRoughViewer），纯译文→单栏（PDFViewer）。
+
+        输出模式是单一配置项，同时决定 BabelDoc 精确翻译的呈现形式与
+        粗糙翻译的查看器布局 —— 用户无需在两种翻译模式下重复选择。
+        """
+        try:
+            mode = str(self._settings.output_mode_combo.currentData() or "dual")
+        except Exception:
+            mode = str(self._app_settings.value("output_mode", "dual") or "dual")
+        if mode == "dual":
             from src.ui.pdf.dual_viewer import DualRoughViewer
             return DualRoughViewer()
         return PDFViewer()
@@ -761,6 +774,24 @@ class MainWindow(
         )
         self._settings.set_status(f"文档: {tab.title}")
         self._sync_rough_ui()
+        self._maybe_hint_resume_rough()
+
+    def _maybe_hint_resume_rough(self) -> None:
+        """切回存在部分粗译的文档时提示一键续译（不自动消耗 API）。"""
+        try:
+            tab = self._active_doc_tab()
+            if not tab or not tab.has_source:
+                return
+            viewer = self._viewer
+            if viewer.rough_is_running() or not viewer.has_rough_segments():
+                return
+            done_n, total_n = viewer.rough_progress_counts()
+            if 0 < done_n < total_n:
+                self._settings.set_status(
+                    f"点击继续翻译（已有 {done_n}/{total_n} 段）"
+                )
+        except Exception:
+            logger.debug("rough resume hint failed", exc_info=True)
 
     def _close_doc_tab(self, index: int) -> None:
         """关闭文档标签页；关闭最后一个后显示空状态。"""
@@ -808,12 +839,19 @@ class MainWindow(
         """粗糙翻译按钮切换。
 
         - checked（切到译文）：首次点击 → 启动翻译；已有内存译文 → 直接复用呈现（不重译）；
-        - unchecked（切回原文）：仅切回透明层，翻译若在后台进行则继续累积。
+        - unchecked（切回原文）：若后台仍在翻译则**真正停止**（已完成段保留，
+          再次点击可续译）；仅切视图不停译的操作不存在 —— 运行中按钮即「停止」。
         """
         viewer = self._viewer
         tab = self._active_doc_tab()
 
         if not checked:
+            if viewer.rough_is_running():
+                viewer.cancel_rough_translation()
+                done_n, total_n = viewer.rough_progress_counts()
+                self._settings.set_status(
+                    f"已停止粗糙翻译（已有 {done_n}/{total_n} 段）— 再次点击可续译剩余段"
+                )
             viewer.set_cover_mode(COVER_TRANSPARENT)
             self._sync_rough_ui()
             return
@@ -854,16 +892,6 @@ class MainWindow(
                 self._rough_btn.setChecked(False)
         self._sync_rough_ui()
 
-    def _on_rough_layout_changed(self) -> None:
-        """「粗糙布局」切换：持久化并重建 viewer（立即生效）。"""
-        mode = self._settings.rough_layout_combo.currentData()
-        self._app_settings.setValue("rough_layout", mode)
-        self._app_settings.sync()
-        self._rebuild_viewer()
-        self._settings.set_status(
-            f"粗糙翻译布局已切换为{'双栏对照' if mode == 'dual' else '单栏覆盖'}"
-        )
-
     def _rebuild_viewer(self) -> None:
         """用新布局的 viewer 替换当前 viewer（断开信号/卸载/重建/重载当前文档）。
 
@@ -881,11 +909,25 @@ class MainWindow(
                 self._rough_sessions[k] = v
         except Exception:
             logger.debug("Failed to export sessions", exc_info=True)
+        # 会话池上限：超出按插入序淘汰最旧（销毁 QPdfDocument 归还句柄），
+        # 防止长期使用中池无界增长；被淘汰文档重开时由粗译 sidecar 兜底恢复译文
+        while len(self._rough_sessions) > 8:
+            key = next(iter(self._rough_sessions))
+            sess = self._rough_sessions.pop(key)
+            doc = sess.get("doc")
+            if doc is not None:
+                try:
+                    if shiboken6.isValid(doc):
+                        shiboken6.delete(doc)
+                except Exception:
+                    logger.debug("Evict pooled session failed: %s", key, exc_info=True)
         for sig in (
             old.text_selected,
             old.translate_requested,
             old.rough_status,
             old.rough_ready,
+            old.rough_progress,
+            old.rough_stats,
             old.text_layer_ready,
         ):
             try:
@@ -905,6 +947,8 @@ class MainWindow(
         self._viewer.translate_requested.connect(self._on_viewer_translate_requested)
         self._viewer.rough_status.connect(self._on_rough_status)
         self._viewer.rough_ready.connect(self._on_rough_ready)
+        self._viewer.rough_progress.connect(self._on_rough_progress)
+        self._viewer.rough_stats.connect(self._on_rough_stats)
         self._viewer.text_layer_ready.connect(self._on_text_layer_ready)
         self._viewer.installEventFilter(self)
         self._main_layout.replaceWidget(old, self._viewer)
@@ -923,13 +967,112 @@ class MainWindow(
     def _on_rough_status(self, message: str) -> None:
         self._settings.set_status(message)
 
+    def _on_rough_progress(self, done: int, total: int) -> None:
+        """粗糙翻译进度：驱动侧边栏进度条（done 含成功 + 最终失败段）。"""
+        if total <= 0:
+            self._progress.hide()
+            return
+        self._progress.setRange(0, total)
+        self._progress.setValue(min(done, total))
+        self._progress.setVisible(True)
+
+    def _on_rough_stats(self, ok: int, failed: int) -> None:
+        """粗糙翻译结束统计：收起进度条、给出成败明细并落盘缓存。
+
+        失败段没有写入译文缓存 → 再次点击「粗译」会自动只补译这些段（续传）。
+        """
+        self._progress.hide()
+        if failed > 0:
+            self._settings.set_status(
+                f"粗糙翻译完成：{ok} 段成功，{failed} 段失败 — 再次点击「粗译」可重试失败段",
+                is_error=True,
+            )
+        else:
+            self._settings.set_status(f"粗糙翻译完成：{ok} 段全部成功")
+        self._save_rough_sidecar()
+
+    # ── 粗译持久化（output/rough_cache/<指纹>.rough.json）────
+
+    def _save_rough_sidecar(self) -> None:
+        """把当前文档的粗译结果写入 sidecar（失败静默，不影响主流程）。"""
+        try:
+            tab = self._active_doc_tab()
+            if not tab or not tab.source_pdf:
+                return
+            result = self._viewer.collect_rough_result()
+            if not result:
+                return
+            profile = self._settings.translation_profile()
+            path = rough_cache_path(
+                self._output_dir, tab.source_hash or "", tab.source_bytes_hash or ""
+            )
+            save_rough_sidecar(
+                path,
+                source_hash=tab.source_hash or "",
+                bytes_hash=tab.source_bytes_hash or "",
+                lang_in=str(profile.get("lang_in", "en")),
+                lang_out=str(profile.get("lang_out", "zh")),
+                translator=str(profile.get("translator", "")),
+                model=str(profile.get("model", "")),
+                pages=result,
+                source_name=tab.source_pdf.name,
+                source_path=str(tab.source_pdf),
+            )
+            logger.info("粗译已缓存: %s", path.name)
+            self._history.refresh()  # 历史面板立即出现「粗译」记录
+        except Exception:
+            logger.debug("保存粗译缓存失败", exc_info=True)
+
+    def _load_rough_sidecar(self) -> int:
+        """文本层就绪后尝试命中历史粗译；返回采纳的段数。"""
+        try:
+            tab = self._active_doc_tab()
+            if not tab or not tab.source_pdf:
+                return 0
+            if not (tab.source_hash or tab.source_bytes_hash):
+                return 0
+            path = rough_cache_path(
+                self._output_dir, tab.source_hash or "", tab.source_bytes_hash or ""
+            )
+            data = load_rough_sidecar(path)
+            if not data:
+                return 0
+            translations = rough_translations_from_sidecar(data)
+            if not translations:
+                return 0
+            applied = self._viewer.apply_rough_translations(translations)
+            if applied:
+                logger.info("命中历史粗译: %d 段", applied)
+            return applied
+        except Exception:
+            logger.debug("载入粗译缓存失败", exc_info=True)
+            return 0
+
+    def _on_history_rough_selected(self, source_path: str) -> None:
+        """点击历史「粗译」记录：重新打开源文件，译文按指纹自动命中。"""
+        p = Path(source_path) if source_path else None
+        if not p or not p.exists():
+            QMessageBox.information(
+                self, "粗译记录",
+                "源文件不存在或已被移动，无法打开。\n"
+                "把同名 PDF 重新拖入即可 — 译文按内容指纹自动命中缓存。",
+            )
+            return
+        self._load_pdf(str(p))
+
     def _on_rough_ready(self) -> None:
         self._sync_rough_ui()
 
     def _on_text_layer_ready(self) -> None:
-        """文本层提取完成：同步按钮态并提示。"""
+        """文本层提取完成：同步按钮态、尝试命中历史粗译并提示。"""
         self._sync_rough_ui()
-        self._settings.set_status("文本层就绪 — 可以开始粗糙翻译")
+        applied = self._load_rough_sidecar()
+        if applied > 0:
+            self._settings.set_status(
+                f"文本层就绪 — 已载入历史粗译 {applied} 段，点击「粗译」查看"
+            )
+        else:
+            self._settings.set_status("文本层就绪 — 可以开始粗糙翻译")
 
     def _sync_rough_ui(self) -> None:
         """按 viewer 当前状态同步粗糙翻译按钮（标签行）。"""
@@ -938,13 +1081,27 @@ class MainWindow(
             has_doc = self._current_pdf is not None or viewer.document is not None
             has_layer = viewer.has_rough_segments()
             translated = viewer.cover_mode == COVER_TRANSLATED
+            running = viewer.rough_is_running()
 
             self._rough_btn.setEnabled(has_doc and has_layer)
             if self._rough_btn.isChecked() != translated:
                 self._rough_btn.blockSignals(True)
                 self._rough_btn.setChecked(translated)
                 self._rough_btn.blockSignals(False)
-            self._rough_btn.setText("粗译译文" if translated else "粗译原文")
+            # 运行中按钮即「停止」：文案与提示随状态切换
+            if running:
+                self._rough_btn.setText("停止粗译")
+                self._rough_btn.setToolTip(
+                    "正在后台翻译 — 点击停止（已完成段保留，可续译）"
+                )
+            else:
+                self._rough_btn.setText("粗译译文" if translated else "粗译原文")
+                self._rough_btn.setToolTip(
+                    "粗糙翻译：点击切换到译文；再点切回原文"
+                )
+            # 翻译不在后台进行时收起进度条（切标签/取消/完成后均会走到这里）
+            if not running:
+                self._progress.hide()
         except Exception:
             import traceback
             traceback.print_exc()
@@ -1010,20 +1167,20 @@ class MainWindow(
         self._signals.finished.connect(self._on_finished)
         self._signals.error_occurred.connect(self._on_error)
         self._history.result_selected.connect(self._on_history_selected)
+        # 历史中的「粗译」记录：重新打开源文件（文本层就绪后自动命中缓存）
+        self._history.rough_selected.connect(self._on_history_rough_selected)
         # 历史删除前释放 viewer 句柄 + 关闭引用被删文件的标签页（Windows 文件锁）
         self._history.about_to_delete_files.connect(self._on_history_delete_files)
-        # 输出模式变更时（历史回放场景）切换双栏/单栏
-        self._settings._output_mode_combo.currentIndexChanged.connect(
+        # 输出模式变更（单/双栏）：重建 viewer —— BabelDoc 结果与粗糙翻译布局统一生效
+        self._settings.output_mode_combo.currentIndexChanged.connect(
             self._on_output_mode_changed
         )
         # ── 粗糙翻译 ──
         self._viewer.rough_status.connect(self._on_rough_status)
         self._viewer.rough_ready.connect(self._on_rough_ready)
+        self._viewer.rough_progress.connect(self._on_rough_progress)
+        self._viewer.rough_stats.connect(self._on_rough_stats)
         self._viewer.text_layer_ready.connect(self._on_text_layer_ready)
-        # 粗糙布局（单栏/双栏）变更 → 重建 viewer
-        self._settings.rough_layout_combo.currentIndexChanged.connect(
-            self._on_rough_layout_changed
-        )
 
     # ═══════════════════════════════════════════════════════════
     # PDF 加载

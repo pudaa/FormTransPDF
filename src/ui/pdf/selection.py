@@ -16,11 +16,14 @@ PDF 文本选择交互 — 划词选择、中键拖拽、浮动工具栏动作�
 
 from __future__ import annotations
 
+import logging
 import urllib.parse
 
 from PySide6.QtCore import QPoint, QRectF, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QMouseEvent
 from PySide6.QtWidgets import QApplication
+
+logger = logging.getLogger(__name__)
 
 
 class TextSelectionMixin:
@@ -122,7 +125,7 @@ class TextSelectionMixin:
     def _search_selected_text(self):
         """搜索选中文本"""
         if self._selected_text:
-            print(f"搜索: {self._selected_text[:50]}")
+            logger.debug("搜索: %s", self._selected_text[:50])
 
     def _clear_selection(self):
         """清除当前选择"""
@@ -132,7 +135,7 @@ class TextSelectionMixin:
 
     def _add_permanent_highlight(self):
         """添加永久高亮"""
-        print(f"标记高亮: {self._selected_text[:50]}")
+        logger.debug("标记高亮: %s", self._selected_text[:50])
 
     # ── 字块拖拽（Alt+左键：把被遮盖的字块拖出来查看）──────────
 

@@ -821,14 +821,13 @@ class MainWindow(QMainWindow):
 
     def _on_start_rough(self) -> None:
         """启动粗糙翻译（复用即时翻译配置，基于原文文本层）。"""
-        print(
-            "[rough] click: pdf=%s doc=%s layer_done=%s seg=%d tab=%d" % (
-                self._current_pdf is not None,
-                self._viewer.document is not None,
-                self._viewer.text_layer_done,
-                self._viewer.rough_segment_count(),
-                self._tab_bar.currentIndex(),
-            )
+        logger.debug(
+            "[rough] click: pdf=%s doc=%s layer_done=%s seg=%d tab=%d",
+            self._current_pdf is not None,
+            self._viewer.document is not None,
+            self._viewer.text_layer_done,
+            self._viewer.rough_segment_count(),
+            self._tab_bar.currentIndex(),
         )
         if not self._current_pdf:
             QMessageBox.information(self, "提示", "请先加载 PDF 文件")
