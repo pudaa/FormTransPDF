@@ -13,7 +13,7 @@
 
 **PDF 论文翻译查看器 — 基于 pdf2zh-next**
 
-"Darkroom for Documents" — 专注的阅读与翻译工坊
+"Darkroom for Documents" — 阅读与翻译工坊
 
 </div>
 
@@ -185,7 +185,7 @@ pip install nuitka
 .\build_nuitka.ps1 -Quick
 ```
 
-Nuitka 会自动检测变更文件，仅重新编译修改的部分，速度很快。
+Nuitka 会自动检测变更文件，仅重新编译修改的部分，增量更新用时20分钟左右。
 
 ### 打包兼容说明
 
