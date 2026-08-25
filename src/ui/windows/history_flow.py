@@ -114,14 +114,18 @@ class _HistoryFlowMixin:
         self._settings.set_status(f"历史: {name}")
 
     def _on_output_mode_changed(self) -> None:
-        """输出模式变更：重建查看器并刷新当前文档视图（统一单/双栏）。
+        """输出模式变更：按新配置刷新当前文档视图。
 
-        输出模式是单一配置项：BabelDoc 精确翻译与粗糙翻译共用它决定单栏/双栏。
-        变更时整体重建 viewer —— 当前标签页（含历史结果标签）会按新模式重新
-        加载对应文件（_rebuild_viewer → _apply_doc_view → _result_target 按
-        output_mode 选 mono/dual 结果），故无需在此手动切换文件。
+        输出模式是单一配置项：BabelDoc 精确翻译与粗糙翻译共用它。同一配置
+        映射为两种呈现实现 —— 原文视图=dual 时用双视口粗糙翻译查看器；
+        译文视图一律单视口渲染对应结果文件（dual 结果本身是双栏同页 PDF）。
+        查看器类型的切换由 _apply_doc_view 的守卫自动完成（含会话迁移）。
         """
-        self._rebuild_viewer()
+        tab = self._active_doc_tab()
+        if tab is not None:
+            self._apply_doc_view(tab)
+        else:
+            self._show_empty_state()
         mode = self._settings.output_mode_combo.currentData()
         label = "双语对照（原文+译文双栏）" if mode == "dual" else "纯译文（译文单栏）"
         self._settings.set_status(f"输出模式已切换为{label}")

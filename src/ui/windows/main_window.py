@@ -200,20 +200,41 @@ class MainWindow(
     def _tp(self) -> ThemePalette:
         return theme_manager.palette
 
-    def _create_viewer(self):
-        """按「输出模式」配置创建查看器：双语对照→双栏（DualRoughViewer），纯译文→单栏（PDFViewer）。
+    def _create_viewer(self, kind: str = "mono"):
+        """按查看器类型创建：dual=双视口（DualRoughViewer），mono=单视口（PDFViewer）。
 
-        输出模式是单一配置项，同时决定 BabelDoc 精确翻译的呈现形式与
-        粗糙翻译的查看器布局 —— 用户无需在两种翻译模式下重复选择。
+        「输出模式」配置到查看器类型的映射由 _required_viewer_kind 决定 ——
+        同一配置对粗糙翻译（原文视图）意味着左右双视口，对 BabelDoc 结果
+        （译文视图）则意味着单视口渲染"已含双栏内容"的 PDF 文件。
         """
-        try:
-            mode = str(self._settings.output_mode_combo.currentData() or "dual")
-        except Exception:
-            mode = str(self._app_settings.value("output_mode", "dual") or "dual")
-        if mode == "dual":
+        if kind == "dual":
             from src.ui.pdf.dual_viewer import DualRoughViewer
             return DualRoughViewer()
         return PDFViewer()
+
+    def _output_mode_config(self) -> str:
+        """读取输出模式配置（"dual" | "mono"）。"""
+        try:
+            return str(self._settings.output_mode_combo.currentData() or "dual")
+        except Exception:
+            return str(
+                self._app_settings.value("output_mode", "dual") or "dual"
+            )
+
+    def _required_viewer_kind(self) -> str:
+        """当前活动视图所需的查看器类型（"dual"=双视口 / "mono"=单视口）。
+
+        同一「输出模式」配置映射为两种不同的呈现实现（配置合并但语义分流）：
+        - 粗糙翻译（原文视图）：dual 配置 → 左右双视口（左原文透明层、右粗译覆盖）；
+        - BabelDoc（译文视图）：无论 dual/mono，结果都是单个 PDF 文件 ——
+          dual 结果本身已把原文+译文排成双栏同一页内，单视口渲染即可，
+          不需要（也不应该）创建两个视口重复呈现同一文件。
+        因此译文视图一律返回 mono；仅原文视图跟随输出模式配置。
+        """
+        tab = self._active_doc_tab()
+        if tab is not None and tab.view == "result":
+            return "mono"
+        return self._output_mode_config()
 
     # ═══════════════════════════════════════════════════════════
     # 文档标签页状态（属性路由到活动标签，兼容既有代码读写）
@@ -317,7 +338,8 @@ class MainWindow(
         self._tab_row = self._build_tab_row()
         main_layout.addWidget(self._tab_row)
 
-        self._viewer = self._create_viewer()
+        self._viewer_kind = self._required_viewer_kind()
+        self._viewer = self._create_viewer(self._viewer_kind)
         self._viewer.text_selected.connect(self._on_text_selected)
         self._viewer.translate_requested.connect(self._on_viewer_translate_requested)
         # 监听 viewer 尺寸变化（侧边栏动画/窗口缩放），实时跟随重定位 minimap
@@ -679,6 +701,13 @@ class MainWindow(
 
     def _apply_doc_view(self, tab: DocumentTab) -> None:
         """按标签页的视图状态把对应文档加载到 viewer。"""
+        # 视图所需查看器类型与当前不符时先重建（dual 配置下 原文⇄译文 切换
+        # 会在 双栏 ⇄ 单栏 间转换；译文视图一律单栏）。重建完成后会再次
+        # 进入本方法完成文档加载（_viewer_kind 已更新，不会无限递归）。
+        required = self._required_viewer_kind()
+        if getattr(self, "_viewer_kind", None) != required:
+            self._rebuild_viewer(required)
+            return
         if tab.view == "result":
             target = self._result_target(tab)
         else:
@@ -853,10 +882,10 @@ class MainWindow(
         - unchecked（切回原文）：若后台仍在翻译则**真正停止**（已完成段保留，
           再次点击可续译）；仅切视图不停译的操作不存在 —— 运行中按钮即「停止」。
         """
-        viewer = self._viewer
         tab = self._active_doc_tab()
 
         if not checked:
+            viewer = self._viewer
             if viewer.rough_is_running():
                 viewer.cancel_rough_translation()
                 done_n, total_n = viewer.rough_progress_counts()
@@ -871,14 +900,18 @@ class MainWindow(
             self._settings.set_status("请先加载 PDF 文件", is_error=True)
             self._rough_btn.setChecked(False)
             return
+        # (b) 防护：粗糙翻译永远基于「原文」文本层 —— 若正在查看译文视图，先切回原文。
+        # 注意：dual 输出模式下该切换会把查看器从单栏重建为双栏（_apply_doc_view
+        # 的类型守卫），因此必须在切换之后重新获取 self._viewer，严禁沿用旧引用。
+        if tab.view != "source":
+            self._set_active_view("source")
+            self._settings.set_status("粗糙翻译基于原文执行 — 已切换回原文视图")
+        viewer = self._viewer
+
         if not viewer.text_layer_done:
             self._settings.set_status("文本层提取中，请稍候再点「粗糙翻译」…")
             self._rough_btn.setChecked(False)
             return
-        # (b) 防护：粗糙翻译永远基于「原文」文本层 —— 若正在查看译文视图，先切回原文
-        if tab.view != "source":
-            self._set_active_view("source")
-            self._settings.set_status("粗糙翻译基于原文执行 — 已切换回原文视图")
 
         if viewer.rough_is_running():
             # 翻译仍在后台进行：直接呈现译文（不打断任务，未译段继续累积）
@@ -903,8 +936,10 @@ class MainWindow(
                 self._rough_btn.setChecked(False)
         self._sync_rough_ui()
 
-    def _rebuild_viewer(self) -> None:
-        """用新布局的 viewer 替换当前 viewer（断开信号/卸载/重建/重载当前文档）。
+    def _rebuild_viewer(self, kind: str | None = None) -> None:
+        """用新查看器替换当前 viewer（断开信号/卸载/重建/重载当前文档）。
+
+        :param kind: 目标查看器类型；None 时按 _required_viewer_kind 自动决定。
 
         minimap 是旧 viewer 的子对象，会随旧 viewer 一并销毁 —— 必须
         先置空引用再重建，否则残留的 self._minimap 指向已删除的 C++ 对象，
@@ -913,6 +948,17 @@ class MainWindow(
         self._destroy_minimap()
 
         old = self._viewer
+        # 粗糙翻译进行中切换查看器：后台任务随旧 viewer 销毁必须停止，
+        # 已完成段保留在会话池中，切回后可一键续译
+        try:
+            if old.rough_is_running():
+                old.cancel_rough_translation()
+                done_n, total_n = old.rough_progress_counts()
+                self._settings.set_status(
+                    f"查看器已切换 — 粗糙翻译已停止（已有 {done_n}/{total_n} 段，可续译）"
+                )
+        except Exception:
+            logger.debug("rough cancel on rebuild failed", exc_info=True)
         # 迁移旧 viewer 的文档会话缓存到共享池（shutdown 会清空其内部缓存；
         # 翻译结果随会话保留，新 viewer 复用后不再重新提取/翻译已完成段落）
         try:
@@ -951,7 +997,10 @@ class MainWindow(
             pass
         old.shutdown()
 
-        self._viewer = self._create_viewer()
+        if kind is None:
+            kind = self._required_viewer_kind()
+        self._viewer_kind = kind
+        self._viewer = self._create_viewer(kind)
         # 注入共享会话池：同一 PDF 的 doc/spans/segments/译文直接复用
         self._viewer.inject_sessions(self._rough_sessions)
         self._viewer.text_selected.connect(self._on_text_selected)
